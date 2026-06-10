@@ -1,5 +1,9 @@
 # Tipo de Cambio SUNAT — App de escritorio + CLI
 
+<div align="center">
+<img width="852" height="632" alt="python_BHrmoUACDl" src="https://github.com/user-attachments/assets/c8b0c9c7-25b9-4a9e-9c96-dce52c28ba5e" />
+</div>
+
 Aplicación en Python (Tkinter) para consultar el **Tipo de Cambio Oficial** publicado por SUNAT.
 Tiene **dos modos**:
 
