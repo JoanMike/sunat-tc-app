@@ -29,3 +29,7 @@ Thumbs.db
 
 # Runtime exports from this app
 tipo_cambio_sunat_*.xlsx
+
+# Local agent caches and registries
+.atl/
+openspec/
