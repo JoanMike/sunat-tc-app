@@ -1,0 +1,5 @@
+# Dev-only dependencies (testing harness, not shipped to end users).
+# Runtime deps stay in requirements.txt.
+pytest>=7.4.0
+pytest-mock>=3.11.0
+requests-mock>=1.11.0
