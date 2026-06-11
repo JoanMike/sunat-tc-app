@@ -21,6 +21,7 @@ from __future__ import annotations
 import calendar
 import json
 import os
+import random
 import sqlite3
 import time
 from datetime import date, datetime, timedelta
@@ -79,8 +80,14 @@ def _normalize_item(item: dict) -> dict | None:
     if not isinstance(item, dict):
         return None
     fecha = item.get("fecha") or item.get("date")
-    compra = item.get("compra") or item.get("buyPrice")
-    venta = item.get("venta") or item.get("sellPrice")
+    # Explicit None check: `or` would treat numeric 0.0 as falsy and fall through
+    # to the legacy English keys, dropping the actual 0-value rate.
+    compra = item.get("compra")
+    if compra is None:
+        compra = item.get("buyPrice")
+    venta = item.get("venta")
+    if venta is None:
+        venta = item.get("sellPrice")
     if not fecha or compra is None or venta is None:
         return None
     try:
@@ -104,30 +111,45 @@ def _coerce_list(data) -> list[dict]:
 
 
 def _get_with_retry(params: dict, max_retries: int = 3) -> list[dict]:
-    """GET con reintentos exponenciales. Devuelve [] si no hay datos o se agotaron los reintentos."""
+    """GET con reintentos exponenciales + jitter. Lanza FetchError en falla persistente.
+
+    404/204 no son errores: devuelven [] (legítimamente "sin datos").
+    """
     delay = 0.5
-    for _ in range(max_retries):
+    for attempt in range(max_retries):
         try:
             r = requests.get(API_BASE, params=params, timeout=HTTP_TIMEOUT)
-        except requests.RequestException:
-            time.sleep(delay)
+        except requests.RequestException as exc:
+            if attempt == max_retries - 1:
+                raise FetchError(kind="network", message=str(exc)) from exc
+            time.sleep(delay + random.uniform(0, delay))
             delay *= 2
             continue
         if r.status_code in (404, 204):
             return []
         if r.status_code in RETRYABLE_STATUS:
-            time.sleep(delay)
+            if attempt == max_retries - 1:
+                raise FetchError(
+                    kind="http_5xx",
+                    message=f"HTTP {r.status_code}",
+                    status=r.status_code,
+                )
+            time.sleep(delay + random.uniform(0, delay))
             delay *= 2
             continue
-        try:
-            r.raise_for_status()
-        except requests.HTTPError:
-            return []
+        if r.status_code >= 400:
+            kind = "http_4xx" if r.status_code < 500 else "http_5xx"
+            raise FetchError(
+                kind=kind,
+                message=f"HTTP {r.status_code}",
+                status=r.status_code,
+            )
         try:
             return _coerce_list(r.json())
-        except ValueError:
-            return []
-    return []
+        except ValueError as exc:
+            raise FetchError(kind="parse", message=str(exc)) from exc
+    # Inalcanzable: cada rama del bucle retorna o lanza.
+    raise FetchError(kind="network", message="reintentos agotados")
 
 
 # ---------------------------------------------------------------------------
