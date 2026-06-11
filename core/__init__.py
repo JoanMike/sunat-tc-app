@@ -35,6 +35,8 @@ import requests
 # ---------------------------------------------------------------------------
 
 from .errors import FetchError  # noqa: F401  (public re-export)
+from .locale import MONTHS_ABBR_ES, MONTHS_ES  # noqa: F401
+from .validators import validate_month, validate_range  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # Constantes
@@ -357,7 +359,7 @@ def fetch_range(
     while (y, m) <= (end.year, end.month):
         month_idx += 1
         if on_progress:
-            nombre = calendar.month_abbr[m]
+            nombre = MONTHS_ABBR_ES[m]
             on_progress(
                 f"Consultando {nombre} {y} ({month_idx}/{total_months})…",
                 len(resultados),
