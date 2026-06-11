@@ -9,7 +9,7 @@ These tests are written BEFORE the corresponding implementation commits
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import MagicMock
 
 import pytest
@@ -136,3 +136,22 @@ def test_fetch_range_cache_hit_skips_sleep(monkeypatch, tmp_cache_dir):
     assert sleep_calls == [], (
         f"fetch_range must skip time.sleep(0.3) on cache hit, got {sleep_calls}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Validator wiring in fetch_range / fetch_month
+# ---------------------------------------------------------------------------
+
+def test_fetch_range_raises_fetcherror_on_invalid_range():
+    """fetch_range must raise FetchError(kind='input') when validators reject."""
+    today = date.today()
+    with pytest.raises(core.FetchError) as exc_info:
+        core.fetch_range(today, today - timedelta(days=1))  # start > end
+    assert exc_info.value.kind == "input"
+
+
+def test_fetch_month_raises_fetcherror_on_invalid_month():
+    """fetch_month must raise FetchError(kind='input') when validators reject."""
+    with pytest.raises(core.FetchError) as exc_info:
+        core.fetch_month(year=1900, month=1)  # year below MIN_YEAR
+    assert exc_info.value.kind == "input"

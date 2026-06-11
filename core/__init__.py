@@ -323,6 +323,10 @@ def fetch_day(day_str: str, *, use_cache: bool = True) -> list[dict]:
 
 def fetch_month(year: int, month: int, *, use_cache: bool = True) -> list[dict]:
     """Consulta un mes. Para meses pasados, sirve del cache si está completo."""
+    v = validate_month(year, month)
+    if isinstance(v, str):
+        raise FetchError(kind="input", message=v)
+    year, month = v
     today_d = date.today()
     is_current_month = year == today_d.year and month == today_d.month
     if use_cache and not is_current_month:
@@ -350,6 +354,10 @@ def fetch_range(
     Atajo de cortesía: si el mes se sirve enteramente del caché (sin red),
     se omite el sleep(0.3) trailing; si hubo red, sí se duerme.
     """
+    v = validate_range(start, end)
+    if isinstance(v, str):
+        raise FetchError(kind="input", message=v)
+    start, end = v
     if end < start:
         return []
     resultados: list[dict] = []
