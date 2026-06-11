@@ -1,0 +1,54 @@
+schema: spec-driven
+
+context: |
+  Tech stack: Python 3.9+ (stdlib + requests>=2.31.0, openpyxl>=3.1.2), Tkinter GUI + argparse CLI, SQLite cache, JSON state.
+  Architecture: 3-file split — `core.py` (data/network/cache, no UI), `app.py` (Tkinter GUI), `cli.py` (argparse). `app.py` is the entry point and dispatches GUI vs CLI based on argv.
+  Testing: Pytest harness bootstrapped (`pytest.ini`, `tests/`, `requirements-dev.txt`); linter / type checker / formatter still NONE. See `strict_tdd: true` below.
+  Style: `from __future__ import annotations`, type hints, snake_case, Spanish UI strings, RFC-2119 spec drafting not yet adopted.
+
+strict_tdd: true
+strict_tdd_reason: |
+  Pytest harness is now bootstrapped (pytest.ini, tests/conftest.py, requirements-dev.txt).
+  Behavior-changing tasks follow red-green-refactor from T1.3 onward in the
+  `fix/judgment-day-round-1` change cycle (Engram #1881, decision 3A).
+
+testing:
+  runner: none
+  layers:
+    unit: false
+    integration: false
+    e2e: false
+  coverage:
+    available: false
+    command: ""
+  quality:
+    linter: { available: false, command: "" }
+    type_checker: { available: false, command: "" }
+    formatter: { available: false, command: "" }
+
+rules:
+  proposal:
+    - Include rollback plan for risky changes
+    - Judgment Day Round 1 findings (15 real: 7 confirmed WARNING + 8 suspect WARNING) must be addressed in this change cycle — see Engram `judgment-day/sunat-tc-app/round-1`
+  specs:
+    - Use Given/When/Then for scenarios
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY)
+    - Default language: English. Spanish only for user-facing UI strings (already Spanish in code)
+  design:
+    - Document architecture decisions with rationale
+    - Show before/after for GUI state changes
+  tasks:
+    - Group by phase, use hierarchical numbering
+    - Keep tasks completable in one session
+    - One work unit per commit (see work-unit-commits skill)
+  apply:
+    tdd: true
+    test_command: "pytest -q"
+    chained_pr_strategy: ask-always
+    review_budget: 400
+  verify:
+    test_command: "pytest -q"
+    build_command: ""
+    coverage_threshold: 0
+  archive:
+    - Warn before merging destructive deltas
