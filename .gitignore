@@ -32,4 +32,3 @@ tipo_cambio_sunat_*.xlsx
 
 # Local agent caches and registries
 .atl/
-openspec/

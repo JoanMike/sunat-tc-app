@@ -39,8 +39,8 @@ sunat-tc-app/
 
 ```powershell
 cd D:\Proyectos\Scripts\sunat-tc-app
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
+py -m venv venv
+.\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
