@@ -56,14 +56,22 @@ MIN_DAYS_FOR_CACHED_MONTH = 15
 # ---------------------------------------------------------------------------
 
 def _app_data_dir() -> Path:
-    """%APPDATA% en Windows, ~/.local/share en Linux/macOS."""
+    """%APPDATA% en Windows, ~/.local/share en Linux/macOS.
+
+    No realiza mkdir; usar _ensure_app_data_dir() antes de leer/escribir.
+    """
     if os.name == "nt":
         base = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
     else:
         base = Path(
             os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")
         )
-    path = base / "sunat-tc-app"
+    return base / "sunat-tc-app"
+
+
+def _ensure_app_data_dir() -> Path:
+    """Crea el dir de datos si no existe; devuelve la ruta. Llamar antes de I/O."""
+    path = _app_data_dir()
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -157,6 +165,7 @@ def _get_with_retry(params: dict, max_retries: int = 3) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _connect() -> sqlite3.Connection:
+    _ensure_app_data_dir()
     conn = sqlite3.connect(CACHE_DB)
     conn.execute(
         """
@@ -334,7 +343,11 @@ def fetch_range(
     use_cache: bool = True,
     on_progress: Callable[[str, int], None] | None = None,
 ) -> list[dict]:
-    """Consulta un rango recorriendo mes a mes."""
+    """Consulta un rango recorriendo mes a mes.
+
+    Atajo de cortesía: si el mes se sirve enteramente del caché (sin red),
+    se omite el sleep(0.3) trailing; si hubo red, sí se duerme.
+    """
     if end < start:
         return []
     resultados: list[dict] = []
@@ -349,6 +362,7 @@ def fetch_range(
                 f"Consultando {nombre} {y} ({month_idx}/{total_months})…",
                 len(resultados),
             )
+        network_happened = _month_requires_network(y, m, use_cache=use_cache)
         meses = fetch_month(y, m, use_cache=use_cache)
         for item in meses:
             try:
@@ -361,11 +375,26 @@ def fetch_range(
             y, m = y + 1, 1
         else:
             m += 1
-        time.sleep(0.3)  # cortesía
+        if network_happened:
+            time.sleep(0.3)  # cortesía
     resultados.sort(key=lambda x: x["fecha"])
     if on_progress:
         on_progress("Procesando resultados…", len(resultados))
     return resultados
+
+
+def _month_requires_network(year: int, month: int, *, use_cache: bool) -> bool:
+    """Predice si `fetch_month(year, month)` hará una llamada de red.
+
+    True cuando: caché desactivado, mes actual, o el caché tiene < MIN_DAYS_FOR_CACHED_MONTH días.
+    """
+    if not use_cache:
+        return True
+    today_d = date.today()
+    if year == today_d.year and month == today_d.month:
+        return True
+    cached = cache_get_month(year, month)
+    return len(cached) < MIN_DAYS_FOR_CACHED_MONTH
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +430,7 @@ def load_state() -> dict:
 def save_state(state: dict) -> bool:
     """Persiste el estado. Devuelve True si pudo escribir."""
     try:
+        _ensure_app_data_dir()
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
         return True
