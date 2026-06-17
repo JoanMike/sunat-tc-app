@@ -136,6 +136,19 @@ Programa:    C:\Proyectos\Scripts\sunat-tc-app\run.bat
 Argumentos:  --range 2024-01-01:%date:~-4%%date:~3,2%%date:~0,2% --xlsx "D:\Reportes\tc.xlsx"
 ```
 
+### Codificación de los CSV
+
+Los archivos generados con `--csv` se escriben en **UTF-8 con BOM** (los
+primeros tres bytes del archivo son `EF BB BF`). Esto hace que Microsoft
+Excel en Windows abra el archivo con la codificación correcta por
+defecto, sin pasos manuales de "Datos > Desde texto". La BOM es
+**obligatoria** en esta versión; no hay un flag `--csv-bom` para
+desactivarla.
+
+La salida con `--json` **no se ve afectada** — sigue siendo UTF-8 puro
+apto para `jq`, redirección a `stdin` de otros procesos, o parseo en
+cualquier lenguaje.
+
 ## Caché local
 
 - **Ubicación:** `%APPDATA%\sunat-tc-app\cache.db` (Windows) / `~/.local/share/sunat-tc-app/cache.db` (Linux/macOS)

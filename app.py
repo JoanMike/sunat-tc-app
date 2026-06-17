@@ -22,7 +22,10 @@ La capa de datos vive en core.py; este archivo sólo contiene el GUI.
 from __future__ import annotations
 
 import calendar
+import logging
+import os
 import queue
+import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -30,14 +33,15 @@ from datetime import date, datetime, timedelta
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable
 
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+# `openpyxl` is imported lazily inside `_export_excel` (T3.6,
+# app-startup-and-imports R1, S11). The GUI/CSV paths must not pay
+# the import cost; `import app` must not load openpyxl at all.
 
 from core import (
     CACHE_DB,
     MIN_YEAR,
     MAX_YEAR,
+    MONTHS_ES,
     cache_clear,
     cache_count,
     cache_date_range,
@@ -52,6 +56,28 @@ from core import (
 # ---------------------------------------------------------------------------
 # Interfaz gráfica
 # ---------------------------------------------------------------------------
+
+
+class _Cancelled(Exception):
+    """Sentinel raised from the worker's progress callback when the user
+    clicks `Cancelar`. The worker catches it and routes to
+    `on_done([], "Consulta cancelada.")`."""
+
+    pass
+
+
+# T3.4 — status bar color taxonomy (gui-worker-lifecycle R4, S12).
+# Centralized so theme changes are one-edit; matching the brief's
+# acceptance ("empty result paints neutral gray, not green").
+_COLOR_INFO = "#1f6feb"      # busy / progress / "Cancelando…"
+_COLOR_OK = "#2da44e"        # success — N rows obtained
+_COLOR_NEUTRAL = "#555"      # "Sin datos", "Caché borrado.", "No se encontraron datos…"
+
+
+# T3.6 — single logger for the `os.startfile` warning path. The spec
+# accepts either a structured logger or a `print(..., file=sys.stderr)`;
+# the logger is more configurable and matches stdlib best practice.
+_logger = logging.getLogger("sunat_tc_app")
 
 class DateEntry(ttk.Frame):
     """
@@ -185,13 +211,31 @@ class SunatTCApp:
 
         # Cargar estado persistido (ventana, modo, fechas)
         self.state = load_state()
-        self.root.geometry(self.state.get("geometry", "850x600"))
+        # T3.5 (app-startup-and-imports R2, S9): if the persisted geometry
+        # is not parseable by Tk (e.g. older releases, manual edits),
+        # fall back to 850x600 and re-persist so the next launch is clean.
+        # No traceback escapes to the user.
+        try:
+            self.root.geometry(self.state.get("geometry", "850x600"))
+        except tk.TclError:
+            self.state["geometry"] = "850x600"
+            self.root.geometry("850x600")
+            # Re-persist so the next launch reads a clean value.
+            save_state(self.state)
         self.root.minsize(850, 600)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.data: list[dict] = []
         self.worker: threading.Thread | None = None
-        self._cancelled = False
+        # Worker generation token (T3.2, gui-worker-lifecycle R3, S4 partial).
+        # Incremented before each Thread.start(); `_on_fetch_done`'s `_update`
+        # closure captures it and discards the result if a newer fetch has
+        # already started (or the current one was cancelled).
+        self._worker_token: int = 0
+        # Cooperative cancel flag (T3.2). The worker checks this between
+        # fetch_* calls and after each on_progress; the Cancelar button
+        # (T3.3) sets it.
+        self._cancel_event: threading.Event = threading.Event()
         self.progress_queue: queue.Queue[str] = queue.Queue()
 
         self._configure_style()
@@ -305,6 +349,12 @@ class SunatTCApp:
             actions, text="Consultar", style="Accent.TButton", command=self._on_fetch
         )
         self.fetch_btn.pack(side=tk.LEFT)
+        # T3.3: Cancelar button — visible only while a worker is alive
+        # (gui-worker-lifecycle R2, S4 + S14).
+        self.cancel_btn = ttk.Button(
+            actions, text="Cancelar", command=self._on_cancel
+        )
+        # Hidden by default; _set_busy(True, ...) packs it next to Consultar.
         self.progress = ttk.Progressbar(actions, mode="indeterminate", length=200)
         self.status = ttk.Label(actions, text="Listo", foreground="#555")
         self.status.pack(side=tk.LEFT, padx=12)
@@ -503,7 +553,7 @@ class SunatTCApp:
             return
         cache_clear()
         self._update_cache_label()
-        self.status.configure(text="Caché borrado.", foreground="#2da44e")
+        self.status.configure(text="Caché borrado.", foreground=_COLOR_NEUTRAL)
 
     def _show_cache_info(self) -> None:
         n = cache_count()
@@ -514,15 +564,26 @@ class SunatTCApp:
             f"Ubicación:\n{CACHE_DB}"
         )
         if messagebox.askyesno("Caché local", msg + "\n\n¿Abrir carpeta?"):
-            try:
-                import os, subprocess
-                folder = str(CACHE_DB.parent)
-                if hasattr(os, "startfile"):
-                    os.startfile(folder)  # type: ignore[attr-defined]
-                else:
-                    subprocess.Popen(["xdg-open", folder])
-            except Exception:
-                pass
+            self._abrir_carpeta(str(CACHE_DB.parent))
+
+    # T3.6 — single helper for the two `os.startfile` call sites
+    # (cache-info and export-complete). On `OSError` (or any subclass)
+    # the failure is observable: WARNING log line + Spanish
+    # `messagebox.showerror`. Returns True on success, False on failure.
+    def _abrir_carpeta(self, path: str) -> bool:
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(path)  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except OSError as exc:
+            _logger.warning("os.startfile failed for %s: %s", path, exc)
+            messagebox.showerror(
+                "Error al abrir carpeta",
+                f"No se pudo abrir la carpeta:\n{path}",
+            )
+            return False
+        return True
 
     def _show_context_menu(self, event) -> None:
         if not self.data:
@@ -533,17 +594,39 @@ class SunatTCApp:
             self.context_menu.grab_release()
 
     # -- fetching -------------------------------------------------------------
-    def _set_busy(self, busy: bool, message: str = "") -> None:
+    def _set_busy(
+        self,
+        busy: bool,
+        message: str = "",
+        color: str | None = None,
+    ) -> None:
+        # T3.4: callers may pass `color` explicitly (e.g. NEUTRAL for
+        # "Sin datos" / "Caché borrado."). The default still maps:
+        # busy=True → INFO, busy=False → OK.
+        if color is None:
+            color = _COLOR_INFO if busy else _COLOR_OK
         if busy:
             self.fetch_btn.configure(state="disabled")
             self.progress.pack(side=tk.LEFT, padx=10)
             self.progress.start(12)
-            self.status.configure(text=message, foreground="#1f6feb")
+            # T3.3: Cancelar is visible only while a worker is alive.
+            self.cancel_btn.pack(side=tk.LEFT, padx=(6, 0))
+            self.status.configure(text=message, foreground=color)
         else:
             self.fetch_btn.configure(state="normal")
             self.progress.stop()
             self.progress.pack_forget()
-            self.status.configure(text=message, foreground="#2da44e")
+            self.cancel_btn.pack_forget()
+            self.status.configure(text=message, foreground=color)
+
+    def _on_cancel(self) -> None:
+        """T3.3: cooperative cancel. Sets the cancel event; the worker
+        observes it at the next safe check point and routes to
+        `on_done([], "Consulta cancelada.")`."""
+        if not (self.worker and self.worker.is_alive()):
+            return
+        self._cancel_event.set()
+        self.status.configure(text="Cancelando…", foreground=_COLOR_INFO)
 
     def _validate_inputs(self) -> tuple[bool, str, dict]:
         """Valida los inputs según el modo. Devuelve (ok, msg_error, params)."""
@@ -578,16 +661,28 @@ class SunatTCApp:
 
     def _on_fetch(self) -> None:
         if self.worker and self.worker.is_alive():
+            # T3.3: explicit-cancel-only (cached decision 2A). Show a
+            # Spanish "Espere a que termine la consulta." message and
+            # return — do NOT auto-cancel, do NOT auto-restart.
+            self.status.configure(
+                text="Espere a que termine la consulta.", foreground=_COLOR_INFO
+            )
             return
         ok, err, params = self._validate_inputs()
         if not ok:
             messagebox.showwarning("Datos inválidos", err)
             return
-        self._cancelled = False
+        # T3.2: bump the generation token and clear any stale cancel flag
+        # BEFORE starting the thread. The token is captured by the
+        # `_on_fetch_done` closure; if a newer fetch starts while this
+        # worker is still in flight, its late callback is discarded.
+        self._worker_token += 1
+        self._cancel_event.clear()
         self._set_busy(True, "Consultando SUNAT…")
         self._clear_table()
         self.worker = threading.Thread(
-            target=self._fetch_worker, args=(params, self._on_fetch_done), daemon=True
+            target=self._fetch_worker, args=(params, self._worker_token, self._on_fetch_done),
+            daemon=True,
         )
         self.worker.start()
         self._poll_progress()
@@ -606,32 +701,54 @@ class SunatTCApp:
         try:
             while True:
                 msg = self.progress_queue.get_nowait()
-                self.status.configure(text=msg, foreground="#1f6feb")
-        except Exception:
+                self.status.configure(text=msg, foreground=_COLOR_INFO)
+        except queue.Empty:
             pass
         # Reagendar. Si entre el check del inicio y ahora el worker murió,
         # la próxima iteración saldrá por el guard de arriba.
         self.root.after(120, self._poll_progress)
 
-    def _fetch_worker(self, params: dict, on_done: Callable[[list[dict], str], None]) -> None:
+    def _fetch_worker(
+        self,
+        params: dict,
+        token: int,
+        on_done: Callable[[list[dict], str], None],
+    ) -> None:
         kind = params["kind"]
 
         def progress(msg: str, _count: int) -> None:
+            # T3.3: cooperative cancel. If the user pressed Cancelar
+            # between fetch calls (or between on_progress invocations
+            # for fetch_range), abort by signalling a sentinel back to
+            # the worker. fetch_range is synchronous, so the abort
+            # surfaces when it returns; the post-loop check below
+            # short-circuits before the on_done call.
+            if self._cancel_event.is_set():
+                raise _Cancelled()
             self.progress_queue.put(msg)
 
         try:
+            if self._cancel_event.is_set():
+                on_done([], "Consulta cancelada.")
+                return
             if kind == "today":
                 progress("Consultando día actual…", 0)
                 rows = fetch_day(date.today().isoformat())
             elif kind == "month":
                 progress(
-                    f"Consultando {calendar.month_name[params['month']]} {params['year']}…", 0
+                    f"Consultando {MONTHS_ES[params['month']]} {params['year']}…", 0
                 )
                 rows = fetch_month(params["year"], params["month"])
             else:  # range
                 rows = fetch_range(params["start"], params["end"], on_progress=progress)
+        except _Cancelled:
+            on_done([], "Consulta cancelada.")
+            return
         except Exception as exc:  # noqa: BLE001
             on_done([], f"Error inesperado: {exc}")
+            return
+        if self._cancel_event.is_set():
+            on_done([], "Consulta cancelada.")
             return
         if not rows:
             on_done([], "No se encontraron datos para el período seleccionado.")
@@ -639,18 +756,33 @@ class SunatTCApp:
             on_done(rows, f"Se obtuvieron {len(rows)} registro(s).")
 
     def _on_fetch_done(self, rows: list[dict], message: str) -> None:
-        # Vuelve al hilo principal
+        # Vuelve al hilo principal. The `_update` closure captures the
+        # current `_worker_token`; if a newer fetch has started, the
+        # token mismatches and the stale result is silently dropped
+        # (T3.2, gui-worker-lifecycle R3, S4 partial).
+        captured_token = self._worker_token
+        # T3.4: choose the color from the outcome kind. Empty results,
+        # cancellation, and unexpected errors paint NEUTRAL; success
+        # (rows obtained) paints OK. The worker doesn't need to know
+        # the colors — `_on_fetch_done` is the single source of truth.
+        if rows:
+            status_color = _COLOR_OK
+        else:
+            status_color = _COLOR_NEUTRAL
+
         def _update() -> None:
+            if captured_token != self._worker_token:
+                return
             self.data = rows
             self._populate_table(rows)
-            self._set_busy(False, message)
+            self._set_busy(False, message, color=status_color)
             self.count_label.configure(text=f"{len(rows)} fila(s)")
             # Drenar cualquier mensaje de progreso pendiente para que
             # una iteración tardía de _poll_progress no pinte nada viejo.
             try:
                 while True:
                     self.progress_queue.get_nowait()
-            except Exception:
+            except queue.Empty:
                 pass
 
         self.root.after(0, _update)
@@ -718,7 +850,7 @@ class SunatTCApp:
         self.root.update()  # asegurar que el portapapeles persista
         n = len(rows) - 1  # descontar cabecera
         self.status.configure(
-            text=f"{n} fila(s) copiada(s) al portapapeles.", foreground="#2da44e"
+            text=f"{n} fila(s) copiada(s) al portapapeles.", foreground=_COLOR_OK
         )
 
     def _copy_selection(self) -> None:
@@ -746,6 +878,12 @@ class SunatTCApp:
         )
         if not filename:
             return
+
+        # T3.6: lazy import — `import app` must not load openpyxl. The
+        # XLSX-only path is the only one paying the cost.
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.utils import get_column_letter
 
         try:
             wb = Workbook()
@@ -809,17 +947,10 @@ class SunatTCApp:
             messagebox.showerror("Error al exportar", f"No se pudo guardar el archivo:\n{exc}")
             return
 
-        self.status.configure(text=f"Exportado a {filename}", foreground="#2da44e")
+        self.status.configure(text=f"Exportado a {filename}", foreground=_COLOR_OK)
         if messagebox.askyesno("Exportación completa", f"Archivo guardado en:\n{filename}\n\n¿Abrir la carpeta?"):
-            try:
-                import os, subprocess
-                folder = os.path.dirname(filename) or "."
-                if hasattr(os, "startfile"):
-                    os.startfile(folder)  # type: ignore[attr-defined]
-                else:
-                    subprocess.Popen(["xdg-open", folder])
-            except Exception:  # noqa: BLE001
-                pass
+            folder = os.path.dirname(filename) or "."
+            self._abrir_carpeta(folder)
 
 
 # ---------------------------------------------------------------------------

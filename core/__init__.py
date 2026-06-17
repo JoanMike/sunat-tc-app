@@ -18,7 +18,6 @@ Estado persistido (JSON en %APPDATA%/sunat-tc-app/state.json):
 
 from __future__ import annotations
 
-import calendar
 import json
 import os
 import random

@@ -138,6 +138,8 @@ The spec (`data-fetch.md:14`) and design (D1) lock `kind ∈ {"network", "http_4
 
 **Suggested fix**: add `input` and `rate_limit` to the data-fetch spec requirement's enumerated set, or split `FetchError` into two classes (`FetchError` for network/HTTP/parse, `InputError` for validators). The latter is cleaner but more code churn.
 
+**Resolution**: fixed in the follow-up mini-fix. `specs/data-fetch.md` and `design/design.md` now authorize `input` and `rate_limit` as valid `FetchError.kind` values.
+
 ### WARNING (theoretical) — dead `import calendar` in `core/__init__.py:21`
 
 The module imports `calendar` but `grep -n 'calendar\.' core/__init__.py` returns 0 matches. The locale constants moved to `core/locale.py`, which also has no `calendar.` reference.
@@ -145,6 +147,8 @@ The module imports `calendar` but `grep -n 'calendar\.' core/__init__.py` return
 **Why it matters**: dead import; a future reader will wonder why it's there. Cheap to remove in any future commit.
 
 **Suggested fix**: drop `import calendar` from `core/__init__.py:21` (and verify no other reference before deleting). Not blocking for archive.
+
+**Resolution**: fixed in the follow-up mini-fix. `core/__init__.py` no longer imports `calendar`; `app.py` keeps its required `calendar` import because GUI code still uses `calendar.monthrange` and `calendar.month_name`.
 
 ### SUGGESTION — T1.7 folded into T1.5 commit
 
@@ -165,8 +169,8 @@ The T1.5 commit is named `typed FetchError + jitter + falsy-zero fix`, which mix
    - This is a user decision; verify does not recommend.
 
 3. **Findings from this report**:
-   - Decide whether to fix the dead `import calendar` in `core/__init__.py:21` now (cheapest in any future commit) or defer.
-   - Decide whether to amend the spec/design to acknowledge the `FetchError.kind` extension (`input` + `rate_limit`) now or in the next cycle.
+   - Resolved in the follow-up mini-fix: removed the dead `import calendar` from `core/__init__.py`.
+   - Resolved in the follow-up mini-fix: amended the spec/design to acknowledge `FetchError.kind` values `input` and `rate_limit`.
 
 4. **Strict TDD for PR 2/3**: `openspec/config.yaml` has `strict_tdd: true` and `apply.tdd: true`. PR 2 and PR 3 must follow RED-first per the config. Apply-progress correctly flagged T1.3 as the first RED commit and respected the contract.
 

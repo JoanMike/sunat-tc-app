@@ -14,9 +14,15 @@ Engram `#1882` (Theme A), Engram `#1883`.
 
 `_get_with_retry` SHALL signal persistent fetch failures by raising a
 `FetchError` exception whose `kind` attribute is one of `"network"`,
-`"http_4xx"`, `"http_5xx"`, or `"parse"`. The function SHALL NOT collapse any
-of these failure modes to a silent `[]`. A 404 or 204 response (legitimately
-"no data for this date") is not a failure and SHALL continue to return `[]`.
+`"http_4xx"`, `"http_5xx"`, `"parse"`, `"rate_limit"`, or `"input"`.
+`_get_with_retry` SHALL NOT collapse any fetch failure mode to a silent `[]`.
+A 404 or 204 response (legitimately "no data for this date") is not a failure
+and SHALL continue to return `[]`.
+
+`"input"` is reserved for validation failures raised by higher-level fetch
+helpers before an HTTP call. `"rate_limit"` is reserved for API throttling
+semantics so CLI and GUI callers can map it explicitly when that branch is
+introduced.
 
 #### Scenario: 5xx after all retries
 - GIVEN the API returns a retryable 5xx status for every attempt

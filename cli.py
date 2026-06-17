@@ -25,18 +25,21 @@ import json
 import sys
 from datetime import date, datetime, timedelta
 
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+# `openpyxl` is imported lazily inside `_save_xlsx` to keep `cli` import
+# cheap and to avoid the GUI/CSV-only paths paying the openpyxl cost
+# (app-startup-and-imports R1, S11).
 
 from core import (
     CACHE_DB,
+    FetchError,
     fetch_day,
     fetch_month,
     fetch_range,
     cache_clear,
     cache_count,
     cache_date_range,
+    validate_month,
+    validate_range,
 )
 
 
@@ -113,7 +116,10 @@ def _print_json(rows: list[dict]) -> None:
 
 
 def _save_csv(rows: list[dict], path: str) -> None:
-    with open(path, "w", newline="", encoding="utf-8") as f:
+    # `utf-8-sig` writes the UTF-8 BOM (EF BB BF) so Microsoft Excel on
+    # Windows opens the file with the correct encoding by default
+    # (csv-export R1, S7).
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(["Fecha", "Compra", "Venta"])
         for r in rows:
@@ -121,6 +127,12 @@ def _save_csv(rows: list[dict], path: str) -> None:
 
 
 def _save_xlsx(rows: list[dict], path: str) -> None:
+    # Lazy import: keeps the cli module cheap for JSON/CSV/--help paths
+    # and the import surface free of openpyxl (app-startup-and-imports R1, S11).
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Tipo de Cambio SUNAT"
@@ -169,6 +181,35 @@ def _save_xlsx(rows: list[dict], path: str) -> None:
     wb.save(path)
 
 
+# Mapping from FetchError.kind to a user-facing Spanish message.
+# `input` should not reach this point (validators run before fetch_*),
+# but is included for completeness.
+_FETCH_ERROR_MESSAGES_ES: dict[str, str] = {
+    "network": "No se pudo conectar con el servicio de SUNAT. Verifique su conexión a internet e intente de nuevo.",
+    "http_4xx": "La consulta fue rechazada por el servicio de SUNAT (HTTP {status}).",
+    "http_5xx": "El servicio de SUNAT no está disponible en este momento (HTTP {status}). Intente de nuevo más tarde.",
+    "parse": "El servicio de SUNAT devolvió una respuesta inesperada. Intente de nuevo más tarde.",
+    "rate_limit": "Demasiadas solicitudes al servicio de SUNAT. Espere un momento e intente de nuevo.",
+    "input": "Parámetros de consulta inválidos.",
+}
+
+
+def _format_fetch_error(exc: FetchError) -> str:
+    """Map a FetchError to a Spanish user-facing message.
+
+    Includes the HTTP status for the `http_*xx` kinds when available so
+    the user can debug intermittent failures without exposing the
+    raw exception text.
+    """
+    template = _FETCH_ERROR_MESSAGES_ES.get(
+        exc.kind,
+        "Error al consultar el tipo de cambio. Intente de nuevo más tarde.",
+    )
+    if exc.kind in ("http_4xx", "http_5xx") and exc.status is not None:
+        return template.format(status=exc.status)
+    return template
+
+
 def run(argv: list[str] | None = None) -> int:
     """Punto de entrada. Devuelve un código de salida."""
     parser = _build_parser()
@@ -212,9 +253,11 @@ def run(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 2
-            if sd > ed:
-                print("Error: la fecha inicial es posterior a la final.", file=sys.stderr)
+            v = validate_range(sd, ed)
+            if isinstance(v, str):
+                print(f"Error: {v}", file=sys.stderr)
                 return 2
+            sd, ed = v
             rows = fetch_range(sd, ed, use_cache=use_cache)
         else:  # args.month
             try:
@@ -223,12 +266,14 @@ def run(argv: list[str] | None = None) -> int:
             except ValueError:
                 print("Error: --month debe tener formato YYYY-MM", file=sys.stderr)
                 return 2
-            if not (1 <= mo <= 12):
-                print("Error: mes fuera de rango (1-12).", file=sys.stderr)
+            v = validate_month(yr, mo)
+            if isinstance(v, str):
+                print(f"Error: {v}", file=sys.stderr)
                 return 2
+            yr, mo = v
             rows = fetch_month(yr, mo, use_cache=use_cache)
-    except Exception as exc:  # noqa: BLE001
-        print(f"Error al consultar: {exc}", file=sys.stderr)
+    except FetchError as exc:
+        print(f"Error: {_format_fetch_error(exc)}", file=sys.stderr)
         return 4
 
     if not rows:

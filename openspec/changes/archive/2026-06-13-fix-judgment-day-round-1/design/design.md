@@ -23,7 +23,7 @@ core.py ──typed errors──▶ cli.py
 
 | # | Decision | Choice | Alternatives rejected | Rationale |
 |---|----------|--------|----------------------|-----------|
-| D1 | `FetchError` shape | Single class `FetchError(Exception)` with `kind: str ∈ {"network","http_4xx","http_5xx","parse"}` and `__cause__` chain. **Lives in new `core/errors.py`.** | Class hierarchy (`NetworkError(HttpStatusError(...))`) | The spec already mandates `kind` as a discriminator; subclassing adds indirection without runtime value. One module = one place to evolve. |
+| D1 | `FetchError` shape | Single class `FetchError(Exception)` with `kind: str ∈ {"network","http_4xx","http_5xx","parse","rate_limit","input"}` and `__cause__` chain. **Lives in new `core/errors.py`.** | Class hierarchy (`NetworkError(HttpStatusError(...))`) | The spec already mandates `kind` as a discriminator; subclassing adds indirection without runtime value. `input` covers validator rejections before HTTP calls; `rate_limit` reserves explicit API-throttling mapping. One module = one place to evolve. |
 | D2 | Retry schedule | `max_retries=3`, base delays `[0.5, 1.0, 2.0]`, jitter `random.uniform(0, delay)` **added to** the base sleep. Jitter modifies sleep, never the next attempt. | Constant sleep; exponential without jitter | Matches proposal intent; jitter avoids thundering herd; tested via `time.sleep` mock. |
 | D3 | Cache-hit short-circuit in `fetch_range` | For each month call `cache_get_month(y, m)`; if `len(cached) >= MIN_DAYS_FOR_CACHED_MONTH` and not current month, reuse. Track `network_happened = False`; only call `time.sleep(0.3)` when `network_happened == True` for the **previous** month iteration. | Pre-check all months up-front (extra DB hit) | Incremental check matches existing `fetch_month` semantics; single source of truth for the "cached?" predicate. |
 | D4 | Quick-filter during worker | **Show non-blocking Spanish message `"Espere a que termine la consulta."` in status bar; do NOT auto-cancel, do NOT auto-start a new query.** | Auto-cancel + restart (suggested in orchestrator brief) | Cached product decision **2A binds** us to explicit-cancel-only. Auto-restart would race with the running worker for `_worker_token` and confuse the user. Honoring 2A is the safest path. |
@@ -44,7 +44,8 @@ core.py ──typed errors──▶ cli.py
 ### `data-fetch` (PR 1)
 
 - New `core/errors.py` with `FetchError` (D1). The class carries `kind`,
-  `message`, and a `__cause__` chain.
+  `message`, and a `__cause__` chain. Valid kinds are `network`, `http_4xx`,
+  `http_5xx`, `parse`, `rate_limit`, and `input`.
 - `_get_with_retry` rewritten: catches `requests.RequestException` → raise
   `FetchError(kind="network")` after retries exhausted; 4xx → raise
   `FetchError(kind="http_4xx", status=code)`; 5xx → raise
@@ -133,7 +134,7 @@ core.py ──typed errors──▶ cli.py
 | `cli.py` | Modify | +40 / -25 | Validator wiring, BOM default, lazy openpyxl, error mapping |
 | `app.py` | Modify | +180 / -50 | Theme D (cancel, token, status colors, quick-filter), Theme E (lazy import, geometry, os.startfile helper) |
 | `tests/conftest.py` | Create | 45 | `tmp_path` + `monkeypatch` of `CACHE_DB`/`STATE_FILE`; `requests_mock` autouse |
-| `tests/test_core.py` | Create | 160 | normalize, coerce, retry (4 kinds), cache CRUD, fetch_range cache-hit short-circuit |
+| `tests/test_core.py` | Create | 160 | normalize, coerce, typed `FetchError` branches, cache CRUD, fetch_range cache-hit short-circuit |
 | `tests/test_validators.py` | Create | 80 | `validate_range` (3 paths), `validate_month` (2 paths) |
 | `tests/test_cli.py` | Create | 90 | `--range`/`--month` exit code 2 paths; CSV BOM bytes; `--help` omits BOM flag |
 | `pytest.ini` | Create | 5 | `testpaths = tests`, `python_files = test_*.py` |
@@ -148,7 +149,7 @@ core.py ──typed errors──▶ cli.py
 ```python
 # core/errors.py
 class FetchError(Exception):
-    kinds = ("network", "http_4xx", "http_5xx", "parse")
+    kinds = ("network", "http_4xx", "http_5xx", "parse", "rate_limit", "input")
     def __init__(self, kind: str, message: str = "", *, status: int | None = None) -> None:
         super().__init__(message or kind)
         self.kind = kind
@@ -185,7 +186,7 @@ class SunatTCApp:
 
 | Layer | What | How |
 |-------|------|-----|
-| Unit (PR 1) | `_normalize_item` falsy-zero, `_coerce_list` edges, `_get_with_retry` 4 `FetchError` kinds + 404 not-an-error, `cache_*` CRUD against `tmp_path` DB, `fetch_range` cache-hit short-circuit, `validate_range` 3 paths, `validate_month` 2 paths, `MONTHS_ES` indices | `pytest` + `requests_mock`; `monkeypatch.setattr(core, "CACHE_DB", tmp_path/"c.db")` per test |
+| Unit (PR 1) | `_normalize_item` falsy-zero, `_coerce_list` edges, typed `FetchError` branches + 404 not-an-error, `cache_*` CRUD against `tmp_path` DB, `fetch_range` cache-hit short-circuit, `validate_range` 3 paths, `validate_month` 2 paths, `MONTHS_ES` indices | `pytest` + `requests_mock`; `monkeypatch.setattr(core, "CACHE_DB", tmp_path/"c.db")` per test |
 | Unit (PR 2) | CLI `--range`/`--month` exit 2 with Spanish stderr; `--csv` first 3 bytes == BOM; `--help` has no `--csv-bom` flag | `capsys` + `argparse` parsing of `cli.run([...])` |
 | Unit (PR 3) | `validate_range` round-trips through GUI `_validate_inputs`; `_abrir_carpeta` returns False on `OSError`; `geometry` fallback path | `monkeypatch.setattr("tk.Tk.geometry", lambda *a, **k: (_ for _ in ()).throw(tk.TclError))` |
 | E2E / smoke | GUI start → fetch today → cancel → fetch month → export XLSX → export CSV | Manual; recorded in PR description (no CI driver) |
