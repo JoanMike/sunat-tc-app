@@ -3,10 +3,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-import pytest
-
 from core import validate_month, validate_range
-
 
 # ---------------------------------------------------------------------------
 # validate_range

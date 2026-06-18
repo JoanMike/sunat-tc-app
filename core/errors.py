@@ -15,6 +15,10 @@ class FetchError(Exception):
     kinds = ("network", "http_4xx", "http_5xx", "parse", "rate_limit", "input")
 
     def __init__(self, kind: str, message: str = "", *, status: int | None = None) -> None:
+        if kind not in self.kinds:
+            raise ValueError(
+                f"Invalid FetchError kind {kind!r}; must be one of {self.kinds}"
+            )
         super().__init__(message or kind)
         self.kind = kind
         self.status = status

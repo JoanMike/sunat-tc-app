@@ -8,21 +8,19 @@ context: |
 
 strict_tdd: true
 strict_tdd_reason: |
-  Pytest harness is now bootstrapped (pytest.ini, tests/conftest.py, requirements-dev.txt).
-  Behavior-changing tasks follow red-green-refactor from T1.3 onward in the
-  `fix/judgment-day-round-1` change cycle (Engram #1881, decision 3A).
+  Pytest harness bootstrapped (pytest.ini, tests/, requirements-dev.txt with pytest, pytest-mock, requests-mock). 63 tests passing across core/cli/app/messages/validators/locale. Behavior-changing tasks follow red-green-refactor; strict TDD has been active since the fix/judgment-day-round-1 change cycle (archived 2026-06-13) and continues through fix-data-layer-bugs (2026-06-17) and fix-gui-lifecycle-bugs (2026-06-17).
 
 testing:
-  runner: none
+  runner: pytest
   layers:
-    unit: false
+    unit: true
     integration: false
     e2e: false
   coverage:
     available: false
     command: ""
   quality:
-    linter: { available: false, command: "" }
+    linter: { available: true, command: "ruff check ." }
     type_checker: { available: false, command: "" }
     formatter: { available: false, command: "" }
 

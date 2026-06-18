@@ -28,16 +28,17 @@ from datetime import date, datetime, timedelta
 # `openpyxl` is imported lazily inside `_save_xlsx` to keep `cli` import
 # cheap and to avoid the GUI/CSV-only paths paying the openpyxl cost
 # (app-startup-and-imports R1, S11).
-
 from core import (
     CACHE_DB,
     FetchError,
-    fetch_day,
-    fetch_month,
-    fetch_range,
+    __version__,
     cache_clear,
     cache_count,
     cache_date_range,
+    fetch_day,
+    fetch_month,
+    fetch_range,
+    format_fetch_error,
     validate_month,
     validate_range,
 )
@@ -47,6 +48,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="sunat-tc",
         description="Consulta el tipo de cambio de SUNAT desde la terminal.",
+    )
+
+    # Q8 (quality-lint-and-hardening D4): `--version` prints
+    # `%(prog)s {__version__}` to stdout and exits 0 via argparse's
+    # `action="version"` — fires during `parse_args`, so no query mode is
+    # required and the fetch path is never reached.
+    p.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
 
     # Query mode (exactly one)
@@ -156,7 +167,15 @@ def _save_xlsx(rows: list[dict], path: str) -> None:
         c.border = border
 
     for r in rows:
-        fecha_obj = datetime.strptime(r["fecha"], "%Y-%m-%d").date()
+        # Defend against a malformed `fecha` (theoretically possible after
+        # manual DB edits or a future API change). Mirror `app.py:916-919`:
+        # fall back to the raw string instead of crashing the export.
+        # The outer `try/except (OSError, ValueError, TypeError)` below
+        # converts any remaining error into the documented exit code 5.
+        try:
+            fecha_obj = datetime.strptime(r["fecha"], "%Y-%m-%d").date()
+        except ValueError:
+            fecha_obj = r["fecha"]
         ws.append([fecha_obj, float(r["compra"]), float(r["venta"])])
 
     last_row = ws.max_row
@@ -181,33 +200,9 @@ def _save_xlsx(rows: list[dict], path: str) -> None:
     wb.save(path)
 
 
-# Mapping from FetchError.kind to a user-facing Spanish message.
-# `input` should not reach this point (validators run before fetch_*),
-# but is included for completeness.
-_FETCH_ERROR_MESSAGES_ES: dict[str, str] = {
-    "network": "No se pudo conectar con el servicio de SUNAT. Verifique su conexión a internet e intente de nuevo.",
-    "http_4xx": "La consulta fue rechazada por el servicio de SUNAT (HTTP {status}).",
-    "http_5xx": "El servicio de SUNAT no está disponible en este momento (HTTP {status}). Intente de nuevo más tarde.",
-    "parse": "El servicio de SUNAT devolvió una respuesta inesperada. Intente de nuevo más tarde.",
-    "rate_limit": "Demasiadas solicitudes al servicio de SUNAT. Espere un momento e intente de nuevo.",
-    "input": "Parámetros de consulta inválidos.",
-}
-
-
-def _format_fetch_error(exc: FetchError) -> str:
-    """Map a FetchError to a Spanish user-facing message.
-
-    Includes the HTTP status for the `http_*xx` kinds when available so
-    the user can debug intermittent failures without exposing the
-    raw exception text.
-    """
-    template = _FETCH_ERROR_MESSAGES_ES.get(
-        exc.kind,
-        "Error al consultar el tipo de cambio. Intente de nuevo más tarde.",
-    )
-    if exc.kind in ("http_4xx", "http_5xx") and exc.status is not None:
-        return template.format(status=exc.status)
-    return template
+# Mapping from FetchError.kind to a user-facing Spanish message moved to
+# `core/messages.py` (Q4 / fix-data-layer-bugs B3). Both the CLI and the
+# GUI import `format_fetch_error` from `core` for a single source of truth.
 
 
 def run(argv: list[str] | None = None) -> int:
@@ -273,7 +268,7 @@ def run(argv: list[str] | None = None) -> int:
             yr, mo = v
             rows = fetch_month(yr, mo, use_cache=use_cache)
     except FetchError as exc:
-        print(f"Error: {_format_fetch_error(exc)}", file=sys.stderr)
+        print(f"Error: {format_fetch_error(exc)}", file=sys.stderr)
         return 4
 
     if not rows:
@@ -293,7 +288,7 @@ def run(argv: list[str] | None = None) -> int:
         else:
             _print_table(rows)
             print(f"\n{len(rows)} fila(s).", file=sys.stderr)
-    except OSError as exc:
+    except (OSError, ValueError, TypeError) as exc:
         print(f"Error al escribir: {exc}", file=sys.stderr)
         return 5
 

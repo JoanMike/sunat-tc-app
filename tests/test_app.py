@@ -15,14 +15,15 @@ needed.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 import tkinter as tk
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
+import core
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -44,15 +45,22 @@ def hidden_root():
     try:
         yield root
     finally:
-        try:
+        with contextlib.suppress(tk.TclError):
             root.destroy()
-        except tk.TclError:
-            pass
 
 
 @pytest.fixture
 def app(hidden_root, tmp_cache_dir, monkeypatch):
-    """Build a SunatTCApp on a hidden root with safe dialog stubs."""
+    """Build a SunatTCApp on a per-test Toplevel with safe dialog stubs.
+
+    Q7 (quality-lint-and-hardening D3): each test gets its own
+    `tk.Toplevel(hidden_root)` instead of stacking widgets on the shared
+    module-scoped root, then the Toplevel is torn down. `hidden_root` stays
+    module-scoped (Python 3.14 `tcl_findLibrary` workaround). Every
+    `self.root.*` call in `SunatTCApp` (`title`/`geometry`/`minsize`/
+    `protocol`/`bind_all`/`after`/`update`/`destroy`) is valid on a Toplevel
+    (it inherits `tk.Wm` + `tk.Misc`).
+    """
     # Stub modal dialogs so any code path that triggers them is a no-op.
     import app as app_module
     monkeypatch.setattr(app_module.messagebox, "showinfo", lambda *a, **k: None)
@@ -68,7 +76,11 @@ def app(hidden_root, tmp_cache_dir, monkeypatch):
         encoding="utf-8",
     )
 
-    return app_module.SunatTCApp(hidden_root)
+    toplevel = tk.Toplevel(hidden_root)
+    toplevel.withdraw()
+    application = app_module.SunatTCApp(toplevel)
+    yield application
+    toplevel.destroy()
 
 
 # ---------------------------------------------------------------------------
@@ -410,4 +422,476 @@ def test_poll_progress_propagates_non_empty_exception(app, monkeypatch):
     # must come from `get_nowait`, not from any other code path).
     assert queue_module.Empty.__mro__[-2:] == (BaseException, object), (
         "queue.Empty inheritance check (test invariant)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T2.6/T2.7 — `_fetch_worker` FetchError branch (B3)
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_worker_fetcherror_uses_spanish_message(app, monkeypatch):
+    """When the fetch layer raises `FetchError`, `_fetch_worker` MUST
+    call `on_done` with a Spanish message produced by
+    `core.format_fetch_error`, NOT the raw `str(exc)` English-y text.
+    The status bar should reflect that Spanish message via
+    `_on_fetch_done` (gui-worker-lifecycle R3, B3).
+    """
+    import app as app_module
+    from core import FetchError
+
+    # Stub the underlying fetch_* helpers to raise a typed FetchError.
+    # `app.py` does `from core import fetch_day, fetch_month, fetch_range`,
+    # so the bound names live on `app` (not on `core`). Patch them in
+    # the `app` module namespace.
+    def boom_day(*a, **kw):
+        raise FetchError(kind="network", message="boom")
+
+    monkeypatch.setattr(app_module, "fetch_day", boom_day)
+    monkeypatch.setattr(app_module, "fetch_month", boom_day)
+    monkeypatch.setattr(app_module, "fetch_range", boom_day)
+
+    seen: list[tuple[list[dict], str]] = []
+
+    def capture_on_done(rows: list[dict], message: str) -> None:
+        seen.append((rows, message))
+
+    # Run the worker synchronously.
+    app._fetch_worker(
+        {"kind": "today"},
+        token=app._worker_token,
+        on_done=capture_on_done,
+    )
+
+    assert len(seen) == 1, f"expected one on_done call, got {seen!r}"
+    rows, message = seen[0]
+    assert rows == [], f"FetchError path must pass empty rows; got {rows!r}"
+
+    # Must NOT echo raw `str(exc)` (which would be the English-ish "boom").
+    assert "boom" not in message.lower(), (
+        f"FetchError path must not echo raw str(exc); got {message!r}"
+    )
+    # Must contain a Spanish marker produced by core.format_fetch_error.
+    assert any(
+        marker in message.lower()
+        for marker in ("sunat", "conexi", "intente", "verifique")
+    ), (
+        f"FetchError(kind='network') must map to a Spanish message via "
+        f"core.format_fetch_error; got {message!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# B6 — _on_close signals cancel and joins the worker before destroy
+# (gui-worker-lifecycle delta: set -> join(2.0) -> save_state -> destroy)
+# ---------------------------------------------------------------------------
+
+
+class _FakeWorker:
+    """Controllable fake worker for `_on_close` tests.
+
+    Stubs `is_alive()` / `join()` so no real thread is spawned and assertions
+    are deterministic (not timing-flaky). `alive` controls `is_alive()`; `join`
+    is a no-op that records the timeout it was called with. When `alive` stays
+    True after `join` returns, the close path simulates a join timeout (the
+    worker did not exit within the bounded window) — exactly the
+    gui-worker-lifecycle "Worker stuck on a slow network" scenario.
+    """
+
+    def __init__(self, alive: bool = True) -> None:
+        self._alive = alive
+        self.join_calls: list = []
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def join(self, timeout: float | None = None) -> None:
+        self.join_calls.append(timeout)
+        # no-op: the real Thread.join(timeout) returns after the timeout
+        # regardless of whether the thread exited; we never block the test.
+
+
+def test_on_close_sets_cancel_event(app, monkeypatch):
+    """`_on_close` SHALL set the cooperative cancel flag before tearing down
+    (gui-worker-lifecycle delta, scenario 'Close during an in-flight fetch')."""
+    import app as app_module
+
+    app.worker = _FakeWorker(alive=True)
+    # Protect the module-scoped shared root: never really destroy it, and
+    # keep save_state off the (tmp) disk so the test stays focused.
+    monkeypatch.setattr(app.root, "destroy", lambda: None)
+    monkeypatch.setattr(app_module, "save_state", lambda state: True)
+
+    app._on_close()
+
+    assert app._cancel_event.is_set(), (
+        "_on_close must set _cancel_event so the in-flight worker aborts at "
+        "its next check point"
+    )
+    assert app.worker.join_calls, (
+        "_on_close must call worker.join when the worker is alive"
+    )
+
+
+def test_on_close_joins_worker_before_destroy(app, monkeypatch):
+    """`_on_close` SHALL join the worker BEFORE destroying the root, so the
+    worker's terminal `root.after(0, _update)` fires while the root is alive
+    and the generation-token guard harmlessly discards the stale result."""
+    import app as app_module
+
+    order: list[str] = []
+    worker = _FakeWorker(alive=True)
+    # Record the call order relative to save/destroy.
+    worker.join = lambda timeout=None: order.append("join")  # type: ignore[assignment]
+    app.worker = worker
+
+    monkeypatch.setattr(
+        app_module, "save_state", lambda state: order.append("save")
+    )
+    monkeypatch.setattr(app.root, "destroy", lambda: order.append("destroy"))
+
+    app._on_close()
+
+    assert "join" in order and "destroy" in order, (
+        f"_on_close must call both join and destroy; got order={order!r}"
+    )
+    assert order.index("join") < order.index("destroy"), (
+        f"worker.join MUST precede root.destroy so the worker's "
+        f"root.after(0, _update) fires while the root is alive; "
+        f"got order={order!r}"
+    )
+
+
+def test_on_close_destroy_still_happens_on_join_timeout(app, monkeypatch):
+    """When the worker stays alive past the join timeout (stalled socket),
+    `_on_close` SHALL still complete: cancel is set, join is attempted, and
+    `root.destroy` still runs (the daemon worker does not block process exit)
+    — gui-worker-lifecycle 'Worker stuck on a slow network' scenario."""
+    import app as app_module
+
+    # Fake worker whose is_alive() stays True even after join returns —
+    # simulates a stalled socket that does not observe cancel within the
+    # bounded 2.0s window.
+    worker = _FakeWorker(alive=True)
+    app.worker = worker
+
+    destroyed: list[bool] = []
+    monkeypatch.setattr(app_module, "save_state", lambda state: True)
+    monkeypatch.setattr(app.root, "destroy", lambda: destroyed.append(True))
+
+    app._on_close()
+
+    assert app._cancel_event.is_set(), (
+        "cancel MUST be set even when the worker does not exit in time"
+    )
+    assert worker.join_calls, "join MUST be attempted before destroy"
+    assert destroyed, (
+        "root.destroy MUST still be called after a join timeout so the close "
+        "completes without hanging (daemon worker does not block exit)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# B7 — _validate_inputs uses the canonical MAX_RANGE_DAYS
+# (input-validation delta: GUI range cap reads core.MAX_RANGE_DAYS, not a literal)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_inputs_uses_max_range_days(app, monkeypatch):
+    """`_validate_inputs` range-cap SHALL read the canonical `MAX_RANGE_DAYS`
+    (re-exported from `core`), not a hardcoded literal, so the GUI cap and
+    `core.validate_range` can never drift (input-validation delta).
+
+    Proven by monkeypatching the app-module binding of `MAX_RANGE_DAYS` to a
+    small value (10) and using a span (20 days) that exceeds the patched cap
+    but is well under the real 730-day cap: the literal-`730` code would NOT
+    reject a 20-day span, so only the constant-driven check can produce the
+    error. The Spanish message MUST interpolate the patched value ("10")."""
+    from datetime import date, timedelta
+
+    import app as app_module
+
+    # Patch the app-module binding (where `_validate_inputs` resolves
+    # MAX_RANGE_DAYS from). raising=False so the RED run — before the
+    # constant is imported into app — does not AttributeError on setattr.
+    monkeypatch.setattr(app_module, "MAX_RANGE_DAYS", 10, raising=False)
+
+    today = date.today()
+    app.mode.set("range")
+    app.start_date.set_date(today - timedelta(days=20))
+    app.end_date.set_date(today)
+
+    ok, msg, _params = app._validate_inputs()
+
+    assert not ok, (
+        f"a 20-day span MUST be rejected when MAX_RANGE_DAYS=10 (the "
+        f"literal-730 path would not reject it); got ok={ok!r}, msg={msg!r}"
+    )
+    assert "10" in msg, (
+        f"the Spanish error message MUST interpolate MAX_RANGE_DAYS (10); "
+        f"got {msg!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Change F — GUI polish UX (G1/G2/G3/G5/G10)
+# ---------------------------------------------------------------------------
+
+
+def test_today_label_refreshes_on_mode_change_to_today(app, monkeypatch):
+    """G1: re-entering 'Hoy' mode refreshes today_label with the current
+    date, so a GUI left open past midnight shows the new 'today' when the
+    user re-selects Hoy (app-startup-and-imports delta)."""
+    from datetime import date as real_date
+
+    import app as app_module
+
+    # Construction used the real date.today(); force a distinct future date
+    # so a refresh is observable (the label must change from real-today to
+    # the patched value).
+    fixed = real_date(2099, 12, 31)
+
+    class _FixedDate(real_date):
+        @classmethod
+        def today(cls):
+            return fixed
+
+    # Leave today mode first (pack the range frame, forget today_label).
+    app.mode.set("range")
+    app._on_mode_change()
+
+    # Now patch date and re-enter today mode.
+    monkeypatch.setattr(app_module, "date", _FixedDate)
+    app.mode.set("today")
+    app._on_mode_change()
+
+    text = str(app.today_label.cget("text"))
+    assert "31/12/2099" in text, (
+        f"today_label must refresh to the current date on re-entering Hoy; "
+        f"got {text!r}"
+    )
+
+
+def test_ctrl_a_selects_all_rows(app):
+    """G2: `_select_all` selects every row in the tree (mirrors the
+    `<Control-a>` binding), so the user can copy/export the whole result
+    set with the keyboard (app-startup-and-imports delta)."""
+    rows = [
+        {"fecha": "2024-01-15", "compra": 3.74, "venta": 3.75},
+        {"fecha": "2024-01-16", "compra": 3.76, "venta": 3.77},
+        {"fecha": "2024-01-17", "compra": 3.78, "venta": 3.79},
+    ]
+    app.data = rows
+    app._populate_table(rows)
+    # Start from an explicit empty selection to prove _select_all does the work.
+    app.tree.selection_set(())
+    assert len(app.tree.selection()) == 0, "fixture precondition: no selection"
+
+    app._select_all()
+
+    assert len(app.tree.selection()) == 3, (
+        f"_select_all must select all 3 rows; got {len(app.tree.selection())}"
+    )
+
+
+def _out_of_order_rows() -> list[dict]:
+    """Three rows NOT ordered by `compra` (middle row has the lowest)."""
+    return [
+        {"fecha": "2024-01-15", "compra": 3.76, "venta": 3.77},
+        {"fecha": "2024-01-16", "compra": 3.74, "venta": 3.75},
+        {"fecha": "2024-01-17", "compra": 3.78, "venta": 3.79},
+    ]
+
+
+def test_sort_by_column_compra_ascending(app):
+    """G3: `_sort_by_column("compra", False)` sorts `self.data` ascending by
+    compra AND repopulates the tree so the `tree.index(iid) -> self.data[i]`
+    invariant `_get_rows_for_copy` depends on still holds."""
+    rows = _out_of_order_rows()
+    app.data = rows
+    app._populate_table(rows)
+
+    app._sort_by_column("compra", False)
+
+    # self.data is now ascending by compra.
+    compras = [r["compra"] for r in app.data]
+    assert compras == [3.74, 3.76, 3.78], (
+        f"self.data must be sorted asc by compra; got {compras}"
+    )
+    # The tree display order matches self.data position-for-position, so the
+    # tree.index(iid) -> self.data[i] invariant is preserved.
+    children = app.tree.get_children()
+    assert len(children) == 3
+    for i, iid in enumerate(children):
+        assert app.tree.index(iid) == i, "tree display position must be dense"
+        # Copy path uses tree.index(iid) to index self.data; verify the
+        # mapping yields the sorted compra values top-to-bottom.
+        row = app.data[app.tree.index(iid)]
+        assert row["compra"] == compras[i], (
+            f"invariant broken at position {i}: tree->{row['compra']} "
+            f"vs data->{compras[i]}"
+        )
+
+
+def test_sort_toggles_direction(app):
+    """G3: clicking the same heading twice toggles `_sort_desc` and the
+    heading indicator flips from `▲` (asc) to `▼` (desc)."""
+    rows = _out_of_order_rows()
+    app.data = rows
+    app._populate_table(rows)
+
+    app._on_heading_click("compra")
+    assert app._sort_col == "compra"
+    assert app._sort_desc is False
+    assert "▲" in str(app.tree.heading("compra")["text"])
+
+    app._on_heading_click("compra")
+    assert app._sort_desc is True
+    assert "▼" in str(app.tree.heading("compra")["text"])
+
+
+def test_sort_resets_on_new_fetch(app, monkeypatch):
+    """G3: a new fetch resets the sort state and clears the heading arrow,
+    because fresh rows arrive fecha-asc from `fetch_range` and the visuals
+    must match the actual order."""
+    # Establish a sort state.
+    app._sort_col = "compra"
+    app._sort_desc = True
+
+    # Drive `_on_fetch_done` (the reset site) with a fresh result set and
+    # drain the scheduled `root.after(0, _update)` so `_update` runs.
+    fresh = [
+        {"fecha": "2024-02-01", "compra": 3.80, "venta": 3.81},
+        {"fecha": "2024-02-02", "compra": 3.82, "venta": 3.83},
+    ]
+    app._on_fetch_done(fresh, "Se obtuvieron 2 registro(s).")
+    # Bump-protect: the token captured by the closure equals the current
+    # token, so `_update` runs. Drain the Tk event loop.
+    app.root.update()
+    app.root.update_idletasks()
+
+    assert app._sort_col is None, "sort state must reset on new fetch"
+    assert app._sort_desc is False, "sort direction must reset on new fetch"
+    assert "▲" not in str(app.tree.heading("compra")["text"]) and (
+        "▼" not in str(app.tree.heading("compra")["text"])
+    ), "heading arrow must be cleared on new fetch"
+
+
+def test_show_about_displays_version(app, monkeypatch):
+    """G5: `_show_about` opens an 'Acerca de' dialog whose message contains
+    the app version (`core.__version__`, the single source of truth) and the
+    SUNAT source attribution (app-startup-and-imports delta, Q8 / D4)."""
+    import app as app_module
+
+    shown: dict[str, str] = {}
+
+    def capture(title, message, **kw):
+        shown["title"] = title
+        shown["message"] = message
+
+    monkeypatch.setattr(app_module.messagebox, "showinfo", capture)
+
+    app._show_about()
+
+    assert "title" in shown, "_show_about must call messagebox.showinfo"
+    assert core.__version__ in shown["message"], (
+        f"about dialog must mention core.__version__ ({core.__version__!r}); "
+        f"got {shown['message']!r}"
+    )
+    assert "SUNAT" in shown["message"], (
+        f"about dialog must mention SUNAT; got {shown['message']!r}"
+    )
+
+
+def test_progressbar_determinate_for_range_mode(app, monkeypatch):
+    """G10: for a range fetch the progressbar MUST switch to determinate
+    mode (the month count is knowable), so the user sees real progress
+    instead of an infinite bounce (gui-worker-lifecycle delta)."""
+    from datetime import date as real_date
+
+    # Stub threading.Thread so no real worker (and no network) runs.
+    class _FakeThread:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self) -> None:
+            pass
+
+        def is_alive(self) -> bool:
+            return False
+
+    monkeypatch.setattr("threading.Thread", _FakeThread)
+
+    today = real_date.today()
+    app.mode.set("range")
+    app.start_date.set_date(today.replace(day=1))
+    app.end_date.set_date(today)
+
+    app._on_fetch()
+
+    mode = str(app.progress.cget("mode"))
+    assert mode == "determinate", (
+        f"range fetch must configure the progressbar as determinate; got {mode!r}"
+    )
+
+
+def test_poll_progress_updates_value_for_range(app, monkeypatch):
+    """G10: `_poll_progress` unpacks the `ProgressUpdate` payload and feeds
+    `progress["value"]` (range mode), while still writing the status text.
+    The worker never touches `self.progress` — value crosses via the
+    queue (thread-safe)."""
+    import app as app_module
+
+    ProgressUpdate = app_module.ProgressUpdate  # RED: AttributeError
+
+    # Feed a determinate payload directly into the queue.
+    app.progress_queue.put(ProgressUpdate("Consultando…", 2, 5))
+
+    # Fake-alive worker so the guard at the top of `_poll_progress` passes.
+    class _LivelyThread:
+        def is_alive(self) -> bool:
+            return True
+
+    app.worker = _LivelyThread()  # type: ignore[assignment]
+
+    # Stub `root.after` so the reschedule does not keep the test alive.
+    monkeypatch.setattr(app.root, "after", lambda *a, **kw: None)
+
+    app._poll_progress()
+
+    assert float(app.progress["value"]) == 2, (
+        f"_poll_progress must feed progress['value'] from the payload; "
+        f"got {app.progress['value']!r}"
+    )
+    assert str(app.status.cget("text")) == "Consultando…", (
+        f"_poll_progress must still write the status text; got "
+        f"{app.status.cget('text')!r}"
+    )
+
+
+def test_set_busy_resets_value_on_idle(app):
+    """G10: `_set_busy(False, ...)` resets the progressbar to its idle
+    default — value back to 0 and mode back to "indeterminate" — so a
+    previous range's determinate bar does not linger on the next idle
+    state (gui-worker-lifecycle delta).
+
+    Note: on this Tk build `ttk.Progressbar.stop()` already zeroes
+    `["value"]`, so the mode reset is the behavior that actually changes
+    in RED; both halves of the idle-reset contract are asserted together.
+    """
+    # Precondition: a finished range fetch left a determinate, part-full bar.
+    app.progress.configure(mode="determinate", maximum=10)
+    app.progress["value"] = 6
+    assert str(app.progress.cget("mode")) == "determinate", "fixture precondition"
+    assert float(app.progress["value"]) == 6, "fixture precondition"
+
+    app._set_busy(False, "Done")
+
+    assert str(app.progress.cget("mode")) == "indeterminate", (
+        f"_set_busy(False) must reset the progressbar mode to indeterminate "
+        f"(idle default); got {app.progress.cget('mode')!r}"
+    )
+    assert float(app.progress["value"]) == 0, (
+        f"_set_busy(False) must reset progress['value'] to 0; got "
+        f"{app.progress['value']!r}"
     )

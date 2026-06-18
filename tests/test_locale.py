@@ -4,8 +4,6 @@ These tests will fail until core/locale.py is created in T1.7.
 """
 from __future__ import annotations
 
-import pytest
-
 
 def test_months_es_full_names_exist():
     """MONTHS_ES must export 13 slots (index 0 unused) with Spanish full names."""

@@ -1,0 +1,10 @@
+# Ruff linter configuration (Q1 / quality-lint-and-hardening D1).
+# Standalone config — the project has no pyproject.toml / setup.cfg.
+# Gate: `ruff check .` exits 0 over the final code state.
+target-version = "py39"
+line-length = 100
+
+[lint]
+# E/W = pycodestyle (style + warnings), F = pyflakes (unused imports/vars),
+# I = isort, UP = pyupgrade, B = flake8-bugbear, SIM = flake8-simplify.
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]

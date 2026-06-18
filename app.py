@@ -22,6 +22,7 @@ La capa de datos vive en core.py; este archivo sólo contiene el GUI.
 from __future__ import annotations
 
 import calendar
+import contextlib
 import logging
 import os
 import queue
@@ -29,6 +30,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+from collections import namedtuple
 from datetime import date, datetime, timedelta
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable
@@ -36,22 +38,24 @@ from typing import Callable
 # `openpyxl` is imported lazily inside `_export_excel` (T3.6,
 # app-startup-and-imports R1, S11). The GUI/CSV paths must not pay
 # the import cost; `import app` must not load openpyxl at all.
-
 from core import (
     CACHE_DB,
+    MAX_RANGE_DAYS,
     MIN_YEAR,
-    MAX_YEAR,
     MONTHS_ES,
+    FetchError,
+    __version__,
     cache_clear,
     cache_count,
     cache_date_range,
     fetch_day,
     fetch_month,
     fetch_range,
+    format_fetch_error,
     load_state,
+    max_year,
     save_state,
 )
-
 
 # ---------------------------------------------------------------------------
 # Interfaz gráfica
@@ -78,6 +82,22 @@ _COLOR_NEUTRAL = "#555"      # "Sin datos", "Caché borrado.", "No se encontraro
 # accepts either a structured logger or a `print(..., file=sys.stderr)`;
 # the logger is more configurable and matches stdlib best practice.
 _logger = logging.getLogger("sunat_tc_app")
+
+# G10 (gui-polish-ux): progress payload crossing the worker→Tk boundary.
+# The worker MUST NOT touch `self.progress` directly (Tk is not
+# thread-safe); `value`/`maximum` cross only via `progress_queue`, which
+# `_poll_progress` drains on the main thread. `value`/`maximum` are None
+# for today/month (indeterminate bar).
+ProgressUpdate = namedtuple("ProgressUpdate", ["msg", "value", "maximum"])
+
+# G3 (gui-polish-ux): (column id, base heading text) pairs used to rewrite
+# heading texts with the ▲/▼ sort indicator and to clear it on a new fetch.
+# Kept in sync with the headings created in `_build_ui`.
+_COLUMN_LABELS: tuple[tuple[str, str], ...] = (
+    ("fecha", "Fecha"),
+    ("compra", "Compra (S/)"),
+    ("venta", "Venta (S/)"),
+)
 
 class DateEntry(ttk.Frame):
     """
@@ -226,6 +246,11 @@ class SunatTCApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.data: list[dict] = []
+        # G3 (gui-polish-ux): heading-click sort state. Reset on every new
+        # fetch (see `_on_fetch_done._update`) because fresh rows arrive
+        # fecha-asc from `fetch_range` and the visuals must match.
+        self._sort_col: str | None = None
+        self._sort_desc: bool = False
         self.worker: threading.Thread | None = None
         # Worker generation token (T3.2, gui-worker-lifecycle R3, S4 partial).
         # Incremented before each Thread.start(); `_on_fetch_done`'s `_update`
@@ -236,7 +261,7 @@ class SunatTCApp:
         # fetch_* calls and after each on_progress; the Cancelar button
         # (T3.3) sets it.
         self._cancel_event: threading.Event = threading.Event()
-        self.progress_queue: queue.Queue[str] = queue.Queue()
+        self.progress_queue: queue.Queue[ProgressUpdate] = queue.Queue()
 
         self._configure_style()
         self._build_ui()
@@ -247,10 +272,8 @@ class SunatTCApp:
     # -- estilo ---------------------------------------------------------------
     def _configure_style(self) -> None:
         style = ttk.Style()
-        try:
+        with contextlib.suppress(tk.TclError):
             style.theme_use("vista")  # nativo en Windows
-        except tk.TclError:
-            pass
         style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
         style.configure("Treeview", font=("Segoe UI", 10), rowheight=24)
         style.configure("TButton", padding=(10, 5))
@@ -317,7 +340,7 @@ class SunatTCApp:
         self.year_spin = ttk.Spinbox(
             self.month_frame,
             from_=MIN_YEAR,
-            to=MAX_YEAR,
+            to=max_year(),
             width=6,
             justify="center",
         )
@@ -367,9 +390,12 @@ class SunatTCApp:
         self.tree = ttk.Treeview(
             table_frame, columns=cols, show="headings", selectmode="extended"
         )
-        self.tree.heading("fecha", text="Fecha", anchor="center")
-        self.tree.heading("compra", text="Compra (S/)", anchor="center")
-        self.tree.heading("venta", text="Venta (S/)", anchor="center")
+        self.tree.heading("fecha", text="Fecha", anchor="center",
+                          command=lambda c="fecha": self._on_heading_click(c))
+        self.tree.heading("compra", text="Compra (S/)", anchor="center",
+                          command=lambda c="compra": self._on_heading_click(c))
+        self.tree.heading("venta", text="Venta (S/)", anchor="center",
+                          command=lambda c="venta": self._on_heading_click(c))
         self.tree.column("fecha", width=160, anchor="center")
         self.tree.column("compra", width=140, anchor="e")
         self.tree.column("venta", width=140, anchor="e")
@@ -402,6 +428,10 @@ class SunatTCApp:
         # Atajos de teclado
         self.tree.bind("<Control-c>", lambda e: self._copy_selection())
         self.tree.bind("<Control-C>", lambda e: self._copy_selection())
+        # G2 (gui-polish-ux): select-all scoped to the tree (not bind_all,
+        # so an entry keeping focus still gets native select-all-in-entry).
+        self.tree.bind("<Control-a>", lambda e: self._select_all())
+        self.tree.bind("<Control-A>", lambda e: self._select_all())
         self.root.bind_all("<Control-e>", lambda e: self._export_excel())
         self.root.bind_all("<Control-E>", lambda e: self._export_excel())
 
@@ -418,6 +448,10 @@ class SunatTCApp:
             bottom, text="Limpiar caché",
             command=self._on_clear_cache,
         ).pack(side=tk.LEFT, padx=(6, 0))
+        # G5 (gui-polish-ux): "Acerca de…" entry in the bottom bar.
+        ttk.Button(
+            bottom, text="Acerca de…", command=self._show_about
+        ).pack(side=tk.LEFT, padx=6)
         ttk.Button(
             bottom, text="Exportar a Excel…", command=self._export_excel
         ).pack(side=tk.RIGHT)
@@ -436,6 +470,12 @@ class SunatTCApp:
             w.pack_forget()
         m = self.mode.get()
         if m == "today":
+            # G1 (gui-polish-ux): refresh on every re-entry so a GUI left
+            # open past midnight shows the new "today" when the user
+            # re-selects Hoy.
+            self.today_label.configure(
+                text=f"Mostrará el tipo de cambio del {date.today().strftime('%d/%m/%Y')}"
+            )
             self.today_label.pack(side=tk.LEFT)
         elif m == "range":
             self.range_frame.pack(side=tk.LEFT)
@@ -491,15 +531,11 @@ class SunatTCApp:
             rs = self.state.get("range_start")
             re_ = self.state.get("range_end")
             if rs:
-                try:
+                with contextlib.suppress(ValueError):
                     self.start_date.set_date(date.fromisoformat(rs))
-                except ValueError:
-                    pass
             if re_:
-                try:
+                with contextlib.suppress(ValueError):
                     self.end_date.set_date(date.fromisoformat(re_))
-                except ValueError:
-                    pass
         elif mode == "month":
             td = date.today()
             try:
@@ -510,6 +546,19 @@ class SunatTCApp:
 
     def _on_close(self) -> None:
         """Persiste geometría + modo + fechas antes de cerrar."""
+        # B6 (gui-worker-lifecycle delta): signal cooperative cancel and join
+        # the in-flight worker BEFORE destroying the root. The worker's
+        # terminal on_done schedules `root.after(0, _update)` from the worker
+        # thread; if destroy() runs first, `root.after` raises a silent
+        # TclError in the worker. Joining first lets the worker observe cancel
+        # at its next check point and fire on_done while the root is alive, so
+        # the generation-token guard harmlessly discards the stale result.
+        # Bounded 2.0s timeout so a stalled socket cannot hang the close; the
+        # worker is a daemon thread, so a timed-out join never blocks process
+        # exit. Mirrors the liveness guard already in `_on_cancel`.
+        self._cancel_event.set()
+        if self.worker and self.worker.is_alive():
+            self.worker.join(timeout=2.0)
         self.state["geometry"] = self.root.geometry()
         self.state["mode"] = self.mode.get()
         if self.mode.get() == "range":
@@ -566,6 +615,15 @@ class SunatTCApp:
         if messagebox.askyesno("Caché local", msg + "\n\n¿Abrir carpeta?"):
             self._abrir_carpeta(str(CACHE_DB.parent))
 
+    def _show_about(self) -> None:
+        """G5 (gui-polish-ux): 'Acerca de' dialog — version + data source."""
+        messagebox.showinfo(
+            "Acerca de",
+            f"Tipo de Cambio SUNAT\nVersión {__version__}\n\n"
+            "Desarrollado por: Jose Miguel Maldonado Garcia\n\n"
+            "Consulta el tipo de cambio oficial publicado por SUNAT.",
+        )
+
     # T3.6 — single helper for the two `os.startfile` call sites
     # (cache-info and export-complete). On `OSError` (or any subclass)
     # the failure is observable: WARNING log line + Spanish
@@ -608,13 +666,21 @@ class SunatTCApp:
         if busy:
             self.fetch_btn.configure(state="disabled")
             self.progress.pack(side=tk.LEFT, padx=10)
-            self.progress.start(12)
+            # G10 (gui-polish-ux): only auto-bounce for indeterminate mode;
+            # determinate mode is fed its value via the progress queue.
+            if str(self.progress.cget("mode")) == "indeterminate":
+                self.progress.start(12)
             # T3.3: Cancelar is visible only while a worker is alive.
             self.cancel_btn.pack(side=tk.LEFT, padx=(6, 0))
             self.status.configure(text=message, foreground=color)
         else:
             self.fetch_btn.configure(state="normal")
             self.progress.stop()
+            # G10 (gui-polish-ux): reset to the idle default so a previous
+            # range's determinate bar (value + mode) does not linger. The
+            # next fetch reconfigures the mode per its kind.
+            self.progress["value"] = 0
+            self.progress.configure(mode="indeterminate")
             self.progress.pack_forget()
             self.cancel_btn.pack_forget()
             self.status.configure(text=message, foreground=color)
@@ -643,8 +709,8 @@ class SunatTCApp:
                 return False, "'Desde' no puede ser mayor que 'Hasta'.", {}
             if ed > date.today():
                 return False, "La fecha 'Hasta' no puede ser futura.", {}
-            if (ed - sd).days > 730:
-                return False, "El rango máximo es de 2 años (730 días).", {}
+            if (ed - sd).days > MAX_RANGE_DAYS:
+                return False, f"El rango máximo es de 2 años ({MAX_RANGE_DAYS} días).", {}
             return True, "", {"kind": "range", "start": sd, "end": ed}
 
         # month
@@ -655,8 +721,8 @@ class SunatTCApp:
             return False, "Mes y año deben ser numéricos.", {}
         if not (1 <= mo <= 12):
             return False, "El mes debe estar entre 1 y 12.", {}
-        if not (MIN_YEAR <= yr <= MAX_YEAR):
-            return False, f"El año debe estar entre {MIN_YEAR} y {MAX_YEAR}.", {}
+        if not (MIN_YEAR <= yr <= max_year()):
+            return False, f"El año debe estar entre {MIN_YEAR} y {max_year()}.", {}
         return True, "", {"kind": "month", "year": yr, "month": mo}
 
     def _on_fetch(self) -> None:
@@ -678,6 +744,19 @@ class SunatTCApp:
         # worker is still in flight, its late callback is discarded.
         self._worker_token += 1
         self._cancel_event.clear()
+        # G10 (gui-polish-ux): configure the progressbar per fetch kind.
+        # Range knows the month count → determinate; today/month are single
+        # shots → indeterminate. `total_months` mirrors core.fetch_range's
+        # month count (core/__init__.py) — keep both in sync if core's
+        # month-stepping ever changes. Configured BEFORE `_set_busy(True)`
+        # so the mode-aware `start(12)` guard skips auto-bounce for range.
+        if params["kind"] == "range":
+            start = params["start"]
+            end = params["end"]
+            total_months = (end.year - start.year) * 12 + (end.month - start.month) + 1
+            self.progress.configure(mode="determinate", maximum=total_months, value=0)
+        else:
+            self.progress.configure(mode="indeterminate")
         self._set_busy(True, "Consultando SUNAT…")
         self._clear_table()
         self.worker = threading.Thread(
@@ -700,8 +779,15 @@ class SunatTCApp:
             return
         try:
             while True:
-                msg = self.progress_queue.get_nowait()
-                self.status.configure(text=msg, foreground=_COLOR_INFO)
+                # G10 (gui-polish-ux): items are ProgressUpdate payloads.
+                # The worker never touches self.progress; value/maximum
+                # cross the thread→Tk boundary only through this queue.
+                payload = self.progress_queue.get_nowait()
+                self.status.configure(text=payload.msg, foreground=_COLOR_INFO)
+                if payload.value is not None:
+                    self.progress["value"] = payload.value
+                if payload.maximum is not None:
+                    self.progress["maximum"] = payload.maximum
         except queue.Empty:
             pass
         # Reagendar. Si entre el check del inicio y ahora el worker murió,
@@ -715,6 +801,19 @@ class SunatTCApp:
         on_done: Callable[[list[dict], str], None],
     ) -> None:
         kind = params["kind"]
+        # G10 (gui-polish-ux): for range mode, count progress callbacks to
+        # feed a determinate bar. `total_months` mirrors core.fetch_range's
+        # month count (core/__init__.py) — keep both in sync if core's
+        # month-stepping ever changes. `month_idx` is a mutable closure cell
+        # so the nested `progress` callback can increment it.
+        if kind == "range":
+            start = params["start"]
+            end = params["end"]
+            total_months = (end.year - start.year) * 12 + (end.month - start.month) + 1
+            month_idx = [0]
+        else:
+            total_months = 0
+            month_idx = [0]
 
         def progress(msg: str, _count: int) -> None:
             # T3.3: cooperative cancel. If the user pressed Cancelar
@@ -725,7 +824,19 @@ class SunatTCApp:
             # short-circuits before the on_done call.
             if self._cancel_event.is_set():
                 raise _Cancelled()
-            self.progress_queue.put(msg)
+            # G10: emit a ProgressUpdate. Range feeds value/maximum (clamped
+            # so the trailing "Procesando resultados…" tick fills the bar);
+            # today/month emit None/None and stay indeterminate. The worker
+            # never touches self.progress.
+            if kind == "range":
+                month_idx[0] += 1
+                self.progress_queue.put(
+                    ProgressUpdate(
+                        msg, min(month_idx[0], total_months), total_months
+                    )
+                )
+            else:
+                self.progress_queue.put(ProgressUpdate(msg, None, None))
 
         try:
             if self._cancel_event.is_set():
@@ -743,6 +854,12 @@ class SunatTCApp:
                 rows = fetch_range(params["start"], params["end"], on_progress=progress)
         except _Cancelled:
             on_done([], "Consulta cancelada.")
+            return
+        except FetchError as exc:
+            # GUI surfaces a Spanish message via core.messages (B3 / Q4);
+            # do NOT fall back to raw `str(exc)` (English-y technical text).
+            # Specific exception order: _Cancelled → FetchError → Exception.
+            on_done([], format_fetch_error(exc))
             return
         except Exception as exc:  # noqa: BLE001
             on_done([], f"Error inesperado: {exc}")
@@ -765,15 +882,16 @@ class SunatTCApp:
         # cancellation, and unexpected errors paint NEUTRAL; success
         # (rows obtained) paints OK. The worker doesn't need to know
         # the colors — `_on_fetch_done` is the single source of truth.
-        if rows:
-            status_color = _COLOR_OK
-        else:
-            status_color = _COLOR_NEUTRAL
+        status_color = _COLOR_OK if rows else _COLOR_NEUTRAL
 
         def _update() -> None:
             if captured_token != self._worker_token:
                 return
             self.data = rows
+            # G3 (gui-polish-ux): fresh rows arrive fecha-asc from
+            # `fetch_range`; drop any sort state + heading arrow so the
+            # visuals match the actual order.
+            self._reset_sort_state()
             self._populate_table(rows)
             self._set_busy(False, message, color=status_color)
             self.count_label.configure(text=f"{len(rows)} fila(s)")
@@ -816,7 +934,49 @@ class SunatTCApp:
         except ValueError:
             return iso_str
 
+    # -- ordenación por columna (G3) -----------------------------------------
+    def _on_heading_click(self, col: str) -> None:
+        """Toggle direction when the same column is re-clicked, else switch
+        column and reset to ascending."""
+        if self._sort_col == col:
+            self._sort_desc = not self._sort_desc
+        else:
+            self._sort_col, self._sort_desc = col, False
+        self._sort_by_column(col, self._sort_desc)
+
+    def _sort_by_column(self, col: str, descending: bool) -> None:
+        """Sort `self.data` by the raw column key, then repopulate from the
+        sorted list so the `tree.index(iid) -> self.data[i]` invariant that
+        `_get_rows_for_copy` depends on is preserved (`fecha` is an ISO
+        string and sorts chronologically; `compra`/`venta` are floats).
+        Finally rewrite the heading texts with an ▲/▼ indicator on the
+        active column."""
+        self.data.sort(key=lambda r: r[col], reverse=descending)
+        self._sort_col = col
+        self._sort_desc = descending
+        self._populate_table(self.data)
+        self._rewrite_headings()
+
+    def _rewrite_headings(self) -> None:
+        for c, base in _COLUMN_LABELS:
+            mark = ""
+            if c == self._sort_col:
+                mark = " ▼" if self._sort_desc else " ▲"
+            self.tree.heading(c, text=base + mark)
+
+    def _reset_sort_state(self) -> None:
+        """Clear sort state + heading indicators (called on a new fetch)."""
+        self._sort_col, self._sort_desc = None, False
+        for c, base in _COLUMN_LABELS:
+            self.tree.heading(c, text=base)
+
     # -- portapapeles ---------------------------------------------------------
+    def _select_all(self) -> None:
+        """G2 (gui-polish-ux): select every row in the tree. Bound to
+        `<Control-a>`/`<Control-A>` on `self.tree`. `selection_set`
+        accepts the full children tuple."""
+        self.tree.selection_set(self.tree.get_children())
+
     def _get_rows_for_copy(self, selected_only: bool) -> list[list[str]]:
         if not self.data:
             return []
@@ -948,7 +1108,8 @@ class SunatTCApp:
             return
 
         self.status.configure(text=f"Exportado a {filename}", foreground=_COLOR_OK)
-        if messagebox.askyesno("Exportación completa", f"Archivo guardado en:\n{filename}\n\n¿Abrir la carpeta?"):
+        msg = f"Archivo guardado en:\n{filename}\n\n¿Abrir la carpeta?"
+        if messagebox.askyesno("Exportación completa", msg):
             folder = os.path.dirname(filename) or "."
             self._abrir_carpeta(folder)
 

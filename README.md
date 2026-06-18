@@ -23,8 +23,17 @@ No requiere clave.
 sunat-tc-app/
 ├── app.py             # GUI + entry point (despacha a GUI o CLI según argv)
 ├── cli.py             # Modo línea de comandos (argparse)
-├── core.py            # Fetching, cache SQLite, persistencia de estado
+├── core/              # Capa de datos (paquete)
+│   ├── __init__.py    # Fetching, cache SQLite, persistencia de estado, re-exports
+│   ├── errors.py      # FetchError tipado
+│   ├── locale.py      # MONTHS_ES / MONTHS_ABBR_ES
+│   ├── validators.py  # validate_range / validate_month + constantes MIN_YEAR/MAX_RANGE_DAYS
+│   └── messages.py    # format_fetch_error (mapeador Spanish de FetchError)
+├── tests/             # Suite pytest (63 tests)
+├── openspec/          # Workspace SDD (specs + changes)
 ├── requirements.txt   # requests, openpyxl
+├── requirements-dev.txt  # pytest, pytest-mock, requests-mock
+├── pytest.ini
 ├── run.bat            # Lanzador para Windows
 └── README.md
 ```
@@ -115,7 +124,8 @@ python app.py --clear-cache
 | Código | Significado |
 |---|---|
 | 0 | OK |
-| 1 | Sin argumentos / help |
+| 0 | --help (ayuda mostrada y salida) |
+| 1 | Sin argumentos (ningún flag de consulta) |
 | 2 | Argumentos inválidos |
 | 3 | No se encontraron datos |
 | 4 | Error de API |
@@ -166,11 +176,15 @@ cualquier lenguaje.
 
 | Archivo | Responsabilidad |
 |---|---|
-| `core.py` | Capa de datos: HTTP, normalización, SQLite cache, JSON state. Sin UI. |
+| `core/__init__.py` | Capa de datos: HTTP con reintentos, normalización, cache SQLite, estado JSON. Sin UI. Re-exports públicos. |
+| `core/errors.py` | `FetchError` tipado (kinds: network/http_4xx/http_5xx/parse/rate_limit/input). |
+| `core/locale.py` | `MONTHS_ES` / `MONTHS_ABBR_ES` para la UI en español. |
+| `core/validators.py` | `validate_range` / `validate_month` + constantes `MIN_YEAR` / `MAX_RANGE_DAYS`. |
+| `core/messages.py` | `format_fetch_error` — mapeador de `FetchError` a mensajes en español. |
 | `app.py` | GUI: `DateEntry`, `SunatTCApp`, filtros rápidos, exporte Excel. Despacha a CLI si hay argv. |
 | `cli.py` | argparse, salida en stdout/JSON/CSV/XLSX, sub-comandos de caché. |
 
-`core.py` es la única que toca la red y el disco. Tanto la GUI como el CLI la consumen.
+`core/` es la única que toca la red y el disco. Tanto la GUI como el CLI la consumen.
 
 ## Notas
 

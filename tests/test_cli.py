@@ -32,7 +32,6 @@ import cli
 import core
 from core import FetchError
 
-
 # ---------------------------------------------------------------------------
 # Input validation
 # ---------------------------------------------------------------------------
@@ -177,4 +176,122 @@ def test_fetch_error_maps_to_spanish_stderr(tmp_cache_dir, capsys, monkeypatch):
         f"FetchError kind=http_5xx should map to a friendly Spanish "
         f"message (must contain one of 'SUNAT', 'servicio', 'intente'); "
         f"got {captured.err!r}"
+    )
+
+
+def test_cli_does_not_define_local_format_fetch_error_shim():
+    """Regression guard: `cli.py` must NOT define a local `_format_fetch_error`
+    shim. The single source of truth for the FetchError → Spanish message
+    mapping lives in `core.messages.format_fetch_error` (Q4 / B3). If this
+    test fails, someone re-introduced the dead shim — call `format_fetch_error`
+    from `core` instead."""
+    assert not hasattr(cli, "_format_fetch_error"), (
+        "cli._format_fetch_error must be removed; use core.format_fetch_error"
+    )
+    # And the module-level mapping dict must be gone too.
+    assert not hasattr(cli, "_FETCH_ERROR_MESSAGES_ES"), (
+        "cli._FETCH_ERROR_MESSAGES_ES must be removed; lives in core.messages"
+    )
+
+
+# ---------------------------------------------------------------------------
+# XLSX malformed-fecha guard (B2)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_xlsx_malformed_fecha_falls_back_to_raw_string(tmp_cache_dir, tmp_path, monkeypatch):
+    """`--xlsx` with a row whose `fecha` is not a valid ISO date must
+    fall back to writing the raw string (mirroring `app.py:916-919`)
+    instead of crashing. Pre-PR-2 the inner `datetime.strptime` raised
+    ValueError that escaped the outer `except OSError`, surfacing as a
+    traceback + exit 1. After the fix the file is written successfully
+    with the raw `fecha` string in the cell.
+    """
+    out_file = tmp_path / "out.xlsx"
+
+    def fake_fetch_range(*args, **kwargs):
+        # `fecha="not-a-date"` is intentionally not ISO-parseable; the
+        # per-row `try/except ValueError` in `_save_xlsx` falls back to
+        # writing the raw string in the cell.
+        return [
+            {"fecha": "not-a-date", "compra": 3.74, "venta": 3.75},
+        ]
+
+    monkeypatch.setattr(core, "fetch_range", fake_fetch_range)
+    monkeypatch.setattr(cli, "fetch_range", fake_fetch_range)
+
+    exit_code = cli.run(
+        ["--range", "2024-01-01:2024-12-31", "--xlsx", str(out_file)]
+    )
+
+    assert exit_code == 0, (
+        f"malformed-fecha xlsx write should succeed (fallback to raw string); "
+        f"got exit={exit_code}"
+    )
+    # File must exist and be non-empty (a real XLSX was written).
+    assert out_file.exists(), "xlsx file should be written"
+    assert out_file.stat().st_size > 0, "xlsx file should be non-empty"
+
+
+def test_cli_xlsx_unexpected_write_error_exits_5(tmp_cache_dir, tmp_path, monkeypatch, capsys):
+    """An unexpected ValueError / TypeError raised anywhere in the output
+    write path MUST be converted to exit 5 with a Spanish
+    "Error al escribir…" message (fix-data-layer-bugs D6 / README contract).
+    Pre-PR-2 the outer `except OSError` did not catch ValueError, so a
+    TypeError or unexpected ValueError escaped as traceback + exit 1.
+    """
+    out_file = tmp_path / "out.xlsx"
+
+    def fake_fetch_range(*args, **kwargs):
+        return [{"fecha": "2024-01-15", "compra": 3.74, "venta": 3.75}]
+
+    monkeypatch.setattr(core, "fetch_range", fake_fetch_range)
+    monkeypatch.setattr(cli, "fetch_range", fake_fetch_range)
+
+    # Patch `wb.save` so the Workbook save itself raises an unexpected
+    # ValueError. The widened `except (OSError, ValueError, TypeError)`
+    # must convert this to exit 5.
+    def boom_save(_path):
+        raise ValueError("simulated unexpected write failure")
+
+    # Lazy import shim: `_save_xlsx` imports `Workbook` lazily, so we
+    # patch the symbol at the module level after import.
+    from openpyxl import Workbook
+    monkeypatch.setattr(Workbook, "save", boom_save)
+
+    exit_code = cli.run(
+        ["--range", "2024-01-01:2024-12-31", "--xlsx", str(out_file)]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 5, (
+        f"unexpected write error must exit 5, got {exit_code}; "
+        f"stderr={captured.err!r}"
+    )
+    assert "error al escribir" in captured.err.lower(), (
+        f"expected Spanish 'Error al escribir' in stderr, got {captured.err!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Q8 — `--version` CLI flag (quality-lint-and-hardening)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_version_flag_exits_0(capsys):
+    """`--version` SHALL print `%(prog)s {__version__}` to stdout and exit 0
+    WITHOUT performing any fetch or cache operation
+    (app-startup-and-imports delta, Q8 / D4). argparse `action="version"`
+    fires during `parse_args`, so `cli.run` raises `SystemExit(0)` before the
+    query path is reached.
+    """
+    with pytest.raises(SystemExit) as exc_info:
+        cli.run(["--version"])
+    assert exc_info.value.code == 0, (
+        f"--version must exit 0, got {exc_info.value.code}"
+    )
+    captured = capsys.readouterr()
+    assert core.__version__ in captured.out, (
+        f"--version stdout must contain core.__version__ ({core.__version__!r}); "
+        f"got {captured.out!r}"
     )

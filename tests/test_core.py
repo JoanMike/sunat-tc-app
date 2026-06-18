@@ -18,7 +18,6 @@ import requests_mock
 
 import core
 
-
 # ---------------------------------------------------------------------------
 # Falsy-zero: _normalize_item
 # ---------------------------------------------------------------------------
@@ -95,6 +94,43 @@ def test_retry_404_returns_empty(monkeypatch):
         assert result == []
 
 
+def test_retry_429_raises_rate_limit_after_exhaustion(monkeypatch):
+    """HTTP 429 x3 must raise FetchError(kind='rate_limit') (B1).
+
+    429 stays in RETRYABLE_STATUS (still retried) but the terminal kind
+    distinguishes it from generic 5xx so the user sees a rate-limit
+    message, not "SUNAT unavailable".
+    """
+    monkeypatch.setattr("core.time.sleep", lambda _d: None)
+    assert 429 in core.RETRYABLE_STATUS, (
+        "429 must remain in RETRYABLE_STATUS for the retry-then-raise pattern"
+    )
+    with requests_mock.Mocker() as m:
+        m.get(core.API_BASE, status_code=429)
+        with pytest.raises(core.FetchError) as exc_info:
+            core._get_with_retry({"date": "2024-01-15"}, max_retries=3)
+        assert exc_info.value.kind == "rate_limit", (
+            f"expected kind='rate_limit' after 429 exhaustion, got {exc_info.value.kind!r}"
+        )
+        assert exc_info.value.status == 429
+        assert m.call_count == 3
+
+
+def test_retry_5xx_exhausted_still_raises_http_5xx(monkeypatch):
+    """Non-429 5xx exhaustion must still raise kind='http_5xx' (B1 regression).
+
+    Guards against the 429 branch swallowing the generic 5xx raise path.
+    """
+    monkeypatch.setattr("core.time.sleep", lambda _d: None)
+    with requests_mock.Mocker() as m:
+        m.get(core.API_BASE, status_code=503)
+        with pytest.raises(core.FetchError) as exc_info:
+            core._get_with_retry({"date": "2024-01-15"}, max_retries=3)
+        assert exc_info.value.kind == "http_5xx"
+        assert exc_info.value.status == 503
+        assert m.call_count == 3
+
+
 # ---------------------------------------------------------------------------
 # Cache CRUD against tmp_path DB
 # ---------------------------------------------------------------------------
@@ -108,6 +144,161 @@ def test_cache_put_and_get_roundtrip(tmp_cache_dir):
     assert row["compra"] == 3.74
     assert row["venta"] == 3.75
     assert row["source"] == "test"
+
+
+# ---------------------------------------------------------------------------
+# perf-cache-batching (Change E) — P1: batched cache writes via cache_put_many
+# ---------------------------------------------------------------------------
+
+def test_cache_put_many_uses_one_connection(monkeypatch, tmp_cache_dir):
+    """cache_put_many must open exactly one SQLite connection for N rows (P1).
+
+    Replaces the per-row `cache_put` pattern that opened one connection per
+    row. We wrap `core._connect` with a counter that still delegates to the
+    real connection (real SQLite on the tmp_path DB), insert 20 rows, and
+    assert `_connect` was called exactly once.
+    """
+    calls = {"n": 0}
+    real_connect = core._connect
+
+    def counting_connect():
+        calls["n"] += 1
+        return real_connect()
+
+    monkeypatch.setattr(core, "_connect", counting_connect)
+    rows = [
+        (f"2024-01-{d:02d}", 3.70 + d * 0.001, 3.75 + d * 0.001, "test")
+        for d in range(1, 21)
+    ]
+    core.cache_put_many(rows)
+    assert calls["n"] == 1, (
+        f"cache_put_many must use one connection for 20 rows, got {calls['n']}"
+    )
+
+
+def test_cache_put_many_upserts_on_conflict(tmp_cache_dir):
+    """cache_put_many must upsert on conflicting fecha (ON CONFLICT DO UPDATE)."""
+    core.cache_put("2024-01-15", 1.0, 1.1, source="old")
+    core.cache_put_many([("2024-01-15", 2.0, 2.1, "new")])
+    row = core.cache_get("2024-01-15")
+    assert row is not None, "upserted row must exist"
+    assert row["compra"] == 2.0, f"compra must be updated to 2.0, got {row['compra']}"
+    assert row["venta"] == 2.1, f"venta must be updated to 2.1, got {row['venta']}"
+    assert row["source"] == "new", f"source must be updated to 'new', got {row['source']!r}"
+
+
+def test_cache_put_still_works_single_row(tmp_cache_dir):
+    """cache_put single-row wrapper must still round-trip after the refactor.
+
+    Approval/regression guard: `cache_put` becomes a thin wrapper over
+    `cache_put_many`, so the single-row contract must not change.
+    """
+    core.cache_put("2024-01-15", 3.74, 3.75, source="test")
+    row = core.cache_get("2024-01-15")
+    assert row is not None
+    assert row["fecha"] == "2024-01-15"
+    assert row["compra"] == 3.74
+    assert row["venta"] == 3.75
+    assert row["source"] == "test"
+
+
+def test_fetch_month_batches_cache_writes(monkeypatch, tmp_cache_dir):
+    """fetch_month must write a multi-row network response via one cache_put_many call."""
+    rows_data = [
+        {"fecha": f"2024-01-{d:02d}", "compra": 3.70, "venta": 3.75}
+        for d in range(1, 21)
+    ]
+    monkeypatch.setattr(core, "_get_with_retry", lambda params, **kw: rows_data)
+    calls: list = []
+    monkeypatch.setattr(
+        core, "cache_put_many", lambda *a, **k: calls.append(a), raising=False
+    )
+    core.fetch_month(2024, 1)
+    assert len(calls) == 1, (
+        f"fetch_month must call cache_put_many once for a 20-row response, "
+        f"got {len(calls)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# perf-cache-batching (Change E) — P2: schema DDL only when DB file missing
+# ---------------------------------------------------------------------------
+
+def _spy_connect_factory(spies: list):
+    """Return a `sqlite3.connect` replacement that wraps each real connection in
+    a `MagicMock(wraps=...)` so `execute`/`commit`/`close` forward to the real
+    SQLite connection while every `execute` call is recorded for inspection.
+
+    `sqlite3.Connection.execute` is read-only, so we cannot patch it on the real
+    connection directly; `MagicMock(wraps=conn)` records and forwards cleanly.
+    Each created mock is appended to `spies` so the test can inspect
+    `mock.execute.call_args_list`.
+    """
+    real_connect = core.sqlite3.connect
+
+    def spy_connect(path, *args, **kwargs):
+        mock_conn = MagicMock(wraps=real_connect(path, *args, **kwargs))
+        spies.append(mock_conn)
+        return mock_conn
+
+    return spy_connect
+
+
+def _ddl_execute_sqls(mock_conn) -> list:
+    """Extract CREATE TABLE / CREATE INDEX SQL strings from a spied connection."""
+    ddl = []
+    for call in mock_conn.execute.call_args_list:
+        sql = call.args[0] if call.args else call.kwargs.get("sql", "")
+        if "CREATE TABLE" in sql or "CREATE INDEX" in sql:
+            ddl.append(sql)
+    return ddl
+
+
+def test_connect_skips_ddl_when_db_exists(monkeypatch, tmp_cache_dir):
+    """A second `_connect` (DB file already present) must NOT run CREATE DDL (P2)."""
+    cache_db, _ = tmp_cache_dir
+    # First call creates the file + initializes the schema (DDL runs here).
+    c0 = core._connect()
+    c0.close()
+    assert cache_db.exists(), "first _connect must create the DB file"
+
+    # Spy on the SECOND call's execute statements.
+    spies: list = []
+    monkeypatch.setattr(core.sqlite3, "connect", _spy_connect_factory(spies))
+    c1 = core._connect()
+    c1.close()
+
+    assert len(spies) == 1, (
+        f"expected one connect on the second _connect, got {len(spies)}"
+    )
+    ddl_calls = _ddl_execute_sqls(spies[0])
+    assert ddl_calls == [], (
+        f"second _connect on an existing DB must skip DDL, got {ddl_calls}"
+    )
+
+
+def test_connect_runs_ddl_when_db_missing(monkeypatch, tmp_cache_dir):
+    """The first `_connect` on a missing DB file must run CREATE TABLE + CREATE INDEX (P2)."""
+    cache_db, _ = tmp_cache_dir
+    assert not cache_db.exists(), "fixture must start with no DB file"
+
+    spies: list = []
+    monkeypatch.setattr(core.sqlite3, "connect", _spy_connect_factory(spies))
+    c = core._connect()
+    c.close()
+
+    assert cache_db.exists(), "first _connect must create the DB file"
+    # The missing-file path may open more than one connection (an init
+    # connection for DDL + the returned connection); the spec scenario is
+    # "DDL runs and the file is created", so we aggregate CREATE statements
+    # across all spied connections rather than asserting a connect count.
+    all_ddl = [sql for spy in spies for sql in _ddl_execute_sqls(spy)]
+    assert any("CREATE TABLE" in s for s in all_ddl), (
+        f"first _connect on missing file must run CREATE TABLE, got {all_ddl}"
+    )
+    assert any("CREATE INDEX" in s for s in all_ddl), (
+        f"first _connect on missing file must run CREATE INDEX, got {all_ddl}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +330,57 @@ def test_fetch_range_cache_hit_skips_sleep(monkeypatch, tmp_cache_dir):
 
 
 # ---------------------------------------------------------------------------
+# perf-cache-batching (Change E) — P3: single cache read per month + P4: 0.1s sleep
+# ---------------------------------------------------------------------------
+
+def test_fetch_range_reads_cache_once_per_month(monkeypatch, tmp_cache_dir):
+    """fetch_range must read each month's cache at most once (P3).
+
+    Previously `fetch_range` called `_month_requires_network` (which reads
+    `cache_get_month`) AND `fetch_month` (which reads `cache_get_month` again
+    on a cache hit) -> two reads per month. The `_fetch_month_with_flag`
+    helper does the lookup once. We pre-populate a fully cached month, spy on
+    `cache_get_month`, and assert exactly one read for that month.
+    """
+    y, m = 2024, 1
+    for d in range(1, 21):  # 20 days > MIN_DAYS_FOR_CACHED_MONTH=15 -> cache hit
+        core.cache_put(f"{y:04d}-{m:02d}-{d:02d}", 3.70, 3.75)
+
+    calls: list = []
+    real_cache_get_month = core.cache_get_month
+
+    def spy_cgmonth(year, month):
+        calls.append((year, month))
+        return real_cache_get_month(year, month)
+
+    monkeypatch.setattr(core, "cache_get_month", spy_cgmonth)
+    core.fetch_range(date(2024, 1, 1), date(2024, 1, 15))
+
+    jan_calls = [c for c in calls if c == (2024, 1)]
+    assert len(jan_calls) == 1, (
+        f"fetch_range must read each month's cache once, got {len(jan_calls)} "
+        f"reads for Jan 2024: {calls}"
+    )
+
+
+def test_fetch_range_sleeps_0_1s_on_network_month(monkeypatch, tmp_cache_dir):
+    """A network-served month must sleep 0.1s (not 0.3s) in fetch_range (P4)."""
+    rows_data = [
+        {"fecha": f"2024-01-{d:02d}", "compra": 3.70, "venta": 3.75}
+        for d in range(1, 21)
+    ]
+    monkeypatch.setattr(core, "_get_with_retry", lambda params, **kw: rows_data)
+    sleep_calls: list = []
+    monkeypatch.setattr(core.time, "sleep", lambda d: sleep_calls.append(d))
+
+    core.fetch_range(date(2024, 1, 1), date(2024, 1, 15))
+
+    assert sleep_calls == [0.1], (
+        f"network month must sleep exactly 0.1s, got {sleep_calls}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Validator wiring in fetch_range / fetch_month
 # ---------------------------------------------------------------------------
 
@@ -155,3 +397,207 @@ def test_fetch_month_raises_fetcherror_on_invalid_month():
     with pytest.raises(core.FetchError) as exc_info:
         core.fetch_month(year=1900, month=1)  # year below MIN_YEAR
     assert exc_info.value.kind == "input"
+
+
+# ---------------------------------------------------------------------------
+# load_state non-dict guard (B4)
+# ---------------------------------------------------------------------------
+
+
+def test_load_state_non_dict_array_returns_default(tmp_cache_dir):
+    """state.json containing a JSON array must yield dict(DEFAULT_STATE)."""
+    _, state_file = tmp_cache_dir
+    state_file.write_text("[1, 2, 3]", encoding="utf-8")
+    state = core.load_state()
+    assert state == dict(core.DEFAULT_STATE), (
+        f"non-dict payload must return DEFAULT_STATE, got {state!r}"
+    )
+
+
+def test_load_state_non_dict_null_returns_default(tmp_cache_dir):
+    """state.json containing `null` must yield dict(DEFAULT_STATE)."""
+    _, state_file = tmp_cache_dir
+    state_file.write_text("null", encoding="utf-8")
+    state = core.load_state()
+    assert state == dict(core.DEFAULT_STATE), (
+        f"null payload must return DEFAULT_STATE, got {state!r}"
+    )
+
+
+def test_load_state_non_dict_scalar_returns_default(tmp_cache_dir):
+    """state.json containing a scalar (number) must yield dict(DEFAULT_STATE)."""
+    _, state_file = tmp_cache_dir
+    state_file.write_text("5", encoding="utf-8")
+    state = core.load_state()
+    assert state == dict(core.DEFAULT_STATE), (
+        f"scalar payload must return DEFAULT_STATE, got {state!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# MIN_YEAR single source of truth (B8)
+# ---------------------------------------------------------------------------
+
+
+def test_min_year_exported_from_validators():
+    """MIN_YEAR is canonically defined in core.validators and re-exported
+    from core (fix-data-layer-bugs D4). We verify the binding by inspecting
+    the `core` module source: there MUST NOT be a second `MIN_YEAR = ...`
+    assignment in `core/__init__.py`, only the re-export import. The
+    `import core` line in this test file already exercises `from core
+    import MIN_YEAR` via the module-level `import core` statement; we just
+    assert the value matches the canonical validators.MIN_YEAR.
+    """
+    from pathlib import Path
+
+    import core.validators as cv
+
+    assert hasattr(core, "MIN_YEAR"), "core.MIN_YEAR must remain a public re-export"
+    assert core.MIN_YEAR == cv.MIN_YEAR, (
+        f"core.MIN_YEAR must equal validators.MIN_YEAR; "
+        f"got core.MIN_YEAR={core.MIN_YEAR!r}, cv.MIN_YEAR={cv.MIN_YEAR!r}"
+    )
+
+    # Guard against a regression: the duplicate definition in
+    # core/__init__.py MUST be gone. We assert by searching the file
+    # for a top-level assignment of MIN_YEAR (any line that starts with
+    # `MIN_YEAR =` after stripping leading whitespace).
+    init_src = Path(__file__).resolve().parent.parent.joinpath(
+        "core", "__init__.py"
+    ).read_text(encoding="utf-8")
+    offender_lines = [
+        ln for ln in init_src.splitlines()
+        if ln.lstrip().startswith("MIN_YEAR ") and "=" in ln
+        and not ln.lstrip().startswith("#")
+    ]
+    assert offender_lines == [], (
+        "core/__init__.py must not redefine MIN_YEAR (single source = "
+        f"core/validators.py); offending line(s): {offender_lines!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# MAX_YEAR → max_year() dynamism (B9)
+# ---------------------------------------------------------------------------
+
+
+def test_max_year_is_dynamic():
+    """`core.max_year()` must return today's year (B9 / fix-data-layer-bugs D3).
+
+    Replaces the import-time module constant `core.MAX_YEAR` (which went
+    stale across midnight on Dec 31) with a function computed on every
+    call.
+    """
+    assert callable(core.max_year), "core.max_year must be a callable"
+    assert core.max_year() == date.today().year, (
+        f"core.max_year() must return date.today().year; "
+        f"got {core.max_year()!r}, expected {date.today().year!r}"
+    )
+
+
+def test_max_year_no_module_constant():
+    """`core.MAX_YEAR` (the old import-time constant) MUST be removed."""
+    assert not hasattr(core, "MAX_YEAR"), (
+        "core.MAX_YEAR must be removed (replaced by core.max_year()); "
+        "any external `from core import MAX_YEAR` consumer was a single "
+        "in-repo user (app.py) updated in the same change."
+    )
+
+
+# ---------------------------------------------------------------------------
+# B5 — DEFAULT_STATE geometry matches the minsize floor (fix-gui-lifecycle-bugs)
+# ---------------------------------------------------------------------------
+
+
+def test_default_state_geometry_is_850x600():
+    """`core.DEFAULT_STATE["geometry"]` SHALL equal the `minsize` floor
+    (`850x600`) so a first launch with no `state.json` is self-consistent
+    with the runtime TclError fallback and the persisted geometry is not
+    stale (fix-gui-lifecycle-bugs B5, app-startup-and-imports delta)."""
+    assert core.DEFAULT_STATE["geometry"] == "850x600", (
+        f"DEFAULT_STATE geometry must equal the minsize floor 850x600; "
+        f"got {core.DEFAULT_STATE['geometry']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# B7 — MAX_RANGE_DAYS single source of truth (re-export from core)
+# ---------------------------------------------------------------------------
+
+
+def test_max_range_days_reexported_from_core():
+    """`MAX_RANGE_DAYS` is canonically defined in `core.validators` and SHALL
+    be re-exported from `core` (fix-gui-lifecycle-bugs D3, input-validation
+    delta). Single source of truth — `core/__init__.py` MUST NOT redefine it,
+    only re-export it, mirroring the `MIN_YEAR` pattern from Change A."""
+    from pathlib import Path
+
+    import core.validators as cv
+
+    assert hasattr(core, "MAX_RANGE_DAYS"), (
+        "core.MAX_RANGE_DAYS must be re-exported from core.validators"
+    )
+    assert core.MAX_RANGE_DAYS == 730, (
+        f"core.MAX_RANGE_DAYS must equal 730 (~2 years); "
+        f"got {core.MAX_RANGE_DAYS!r}"
+    )
+    assert core.MAX_RANGE_DAYS == cv.MAX_RANGE_DAYS, (
+        f"core.MAX_RANGE_DAYS must equal validators.MAX_RANGE_DAYS; "
+        f"got core.MAX_RANGE_DAYS={core.MAX_RANGE_DAYS!r}, "
+        f"cv.MAX_RANGE_DAYS={cv.MAX_RANGE_DAYS!r}"
+    )
+
+    # Guard against a regression: core/__init__.py MUST NOT contain a
+    # second `MAX_RANGE_DAYS = ...` assignment — only the re-export import.
+    # (A `MAX_RANGE_DAYS =` line starts with the name then `=`; the
+    # `from .validators import MAX_RANGE_DAYS, ...` re-export starts with
+    # `from`, so it is correctly excluded.)
+    init_src = Path(__file__).resolve().parent.parent.joinpath(
+        "core", "__init__.py"
+    ).read_text(encoding="utf-8")
+    offender_lines = [
+        ln for ln in init_src.splitlines()
+        if ln.lstrip().startswith("MAX_RANGE_DAYS ") and "=" in ln
+        and not ln.lstrip().startswith("#")
+    ]
+    assert offender_lines == [], (
+        "core/__init__.py must not redefine MAX_RANGE_DAYS (single source = "
+        f"core/validators.py); offending line(s): {offender_lines!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Q2 — FetchError kind validation at construction (quality-lint-and-hardening)
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_error_invalid_kind_raises_valueerror():
+    """Constructing a FetchError with a kind not in `FetchError.kinds` MUST
+    raise `ValueError` (not `FetchError`) before any instance attribute is set
+    or `super().__init__` is called (data-fetch delta, Q2 / D2).
+    """
+    with pytest.raises(ValueError, match="Invalid FetchError kind"):
+        core.FetchError("bogus")
+
+
+def test_fetch_error_valid_kind_constructs_normally():
+    """Triangulation: a valid kind must still construct and populate
+    `.kind` / `.status` and carry the message through `str(exc)` (data-fetch
+    delta "Valid kinds still construct normally"). Guards against a Fake-It
+    that rejects every kind.
+    """
+    exc = core.FetchError(kind="network", message="down", status=None)
+    assert exc.kind == "network"
+    assert exc.status is None
+    assert str(exc) == "down"
+
+
+# ---------------------------------------------------------------------------
+# Q8 — centralized `__version__` (quality-lint-and-hardening)
+# ---------------------------------------------------------------------------
+
+
+def test_core_has_version():
+    """`core.__version__` SHALL be the single source of truth for the app
+    version (app-startup-and-imports delta, Q8 / D4)."""
+    assert core.__version__ == "1.0.0"

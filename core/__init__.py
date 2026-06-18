@@ -23,11 +23,18 @@ import os
 import random
 import sqlite3
 import time
+from collections.abc import Iterable
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
 import requests
+
+# Single source of truth for the application version (Q8 /
+# quality-lint-and-hardening D4). Surfaced via the `--version` CLI flag
+# (cli.py) and the "Acerca de" dialog (app.py). Supersedes the temporary
+# `_APP_VERSION` placeholder from Change F.
+__version__ = "1.0.0"
 
 # ---------------------------------------------------------------------------
 # Re-exports (submodules)
@@ -35,7 +42,8 @@ import requests
 
 from .errors import FetchError  # noqa: F401  (public re-export)
 from .locale import MONTHS_ABBR_ES, MONTHS_ES  # noqa: F401
-from .validators import validate_month, validate_range  # noqa: F401
+from .messages import format_fetch_error  # noqa: F401  (Spanish FetchError mapper)
+from .validators import MAX_RANGE_DAYS, MIN_YEAR, validate_month, validate_range  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # Constantes
@@ -43,9 +51,19 @@ from .validators import validate_month, validate_range  # noqa: F401
 
 API_BASE = "https://api.apis.net.pe/v1/tipo-cambio-sunat"
 HTTP_TIMEOUT = 15  # segundos
-MAX_YEAR = date.today().year
-MIN_YEAR = 2000
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def max_year() -> int:
+    """Año actual; se computa fresh en cada llamada (no constante de módulo).
+
+    Reemplaza el antiguo `MAX_YEAR` que se evaluaba una sola vez al
+    importar y quedaba stale pasada la medianoche del 31 de diciembre
+    (fix-data-layer-bugs D3). Long-running processes (e.g. la GUI abierta
+    toda la noche) ven el límite superior del spinbox de año fresco en
+    cada invocación.
+    """
+    return date.today().year
 
 # Para "mes completo" decidimos que el cache es confiable si trae al menos
 # estos días (un mes tiene entre 20 y 23 días hábiles aprox.).
@@ -138,6 +156,18 @@ def _get_with_retry(params: dict, max_retries: int = 3) -> list[dict]:
             return []
         if r.status_code in RETRYABLE_STATUS:
             if attempt == max_retries - 1:
+                # 429 (rate limit) stays in RETRYABLE_STATUS so it benefits
+                # from the existing exponential-backoff schedule, but the
+                # terminal FetchError.kind is "rate_limit" so callers can
+                # surface a "Demasiadas solicitudes…" message instead of
+                # the generic "SUNAT no está disponible (HTTP 429)" text
+                # that http_5xx would produce (fix-data-layer-bugs D1).
+                if r.status_code == 429:
+                    raise FetchError(
+                        kind="rate_limit",
+                        message=f"HTTP {r.status_code}",
+                        status=r.status_code,
+                    )
                 raise FetchError(
                     kind="http_5xx",
                     message=f"HTTP {r.status_code}",
@@ -167,21 +197,35 @@ def _get_with_retry(params: dict, max_retries: int = 3) -> list[dict]:
 
 def _connect() -> sqlite3.Connection:
     _ensure_app_data_dir()
-    conn = sqlite3.connect(CACHE_DB)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS rates (
-            fecha       TEXT PRIMARY KEY,
-            compra      REAL NOT NULL,
-            venta       REAL NOT NULL,
-            source      TEXT,
-            fetched_at  TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_rates_fecha ON rates(fecha)")
-    conn.commit()
-    return conn
+    # Stateless file-existence guard (perf-cache-batching P2): run CREATE DDL
+    # only when the DB file is missing. The check MUST happen before
+    # `sqlite3.connect`, which creates the file itself. No module-level flag or
+    # lock -> thread-safe by design; correctly re-runs DDL if the file is
+    # deleted between calls. `IF NOT EXISTS` keeps it idempotent if two threads
+    # race on a missing file. Known limitation: a file that exists but lacks the
+    # `rates` table (manual tampering) skips DDL -> first cache_* call raises
+    # OperationalError; acceptable for a single-user desktop app.
+    if not CACHE_DB.exists():
+        conn_init = sqlite3.connect(CACHE_DB)
+        try:
+            conn_init.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rates (
+                    fecha       TEXT PRIMARY KEY,
+                    compra      REAL NOT NULL,
+                    venta       REAL NOT NULL,
+                    source      TEXT,
+                    fetched_at  TEXT NOT NULL
+                )
+                """
+            )
+            conn_init.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rates_fecha ON rates(fecha)"
+            )
+            conn_init.commit()
+        finally:
+            conn_init.close()
+    return sqlite3.connect(CACHE_DB)
 
 
 def cache_get(fecha: str) -> dict | None:
@@ -229,19 +273,32 @@ def cache_get_range(start: date, end: date) -> dict[str, dict]:
 
 def cache_get_month(year: int, month: int) -> dict[str, dict]:
     start = date(year, month, 1)
-    if month == 12:
-        end = date(year + 1, 1, 1)
-    else:
-        end = date(year, month + 1, 1)
+    end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
     # end es exclusivo en SQL BETWEEN (que es inclusivo), así que restamos 1.
     end_inclusive = end - timedelta(days=1)
     return cache_get_range(start, end_inclusive)
 
 
-def cache_put(fecha: str, compra: float, venta: float, source: str = "apis.net.pe") -> None:
+def cache_put_many(
+    rows: Iterable[tuple],
+    source: str = "apis.net.pe",
+) -> None:
+    """Inserta/actualiza N filas con UNA conexión, UN `executemany` y UN commit.
+
+    Cada tupla es `(fecha, compra, venta)` o `(fecha, compra, venta, source)`;
+    si se omite `source` por fila, usa el `source` por defecto del argumento.
+    Las semánticas de upsert (`ON CONFLICT(fecha) DO UPDATE`) son idénticas a
+    `cache_put`. `fetched_at` se computa una vez por batch (semántica "filas
+    traídas juntas"). Reemplaza el patrón anterior de una conexión por fila
+    (perf-cache-batching P1).
+    """
+    rows_list = list(rows)
+    if not rows_list:
+        return
     conn = _connect()
     try:
-        conn.execute(
+        fetched_at = datetime.now().isoformat(timespec="seconds")
+        conn.executemany(
             """
             INSERT INTO rates (fecha, compra, venta, source, fetched_at)
             VALUES (?, ?, ?, ?, ?)
@@ -251,17 +308,19 @@ def cache_put(fecha: str, compra: float, venta: float, source: str = "apis.net.p
                 source=excluded.source,
                 fetched_at=excluded.fetched_at
             """,
-            (
-                fecha,
-                float(compra),
-                float(venta),
-                source,
-                datetime.now().isoformat(timespec="seconds"),
-            ),
+            [
+                (r[0], float(r[1]), float(r[2]), r[3] if len(r) > 3 else source, fetched_at)
+                for r in rows_list
+            ],
         )
         conn.commit()
     finally:
         conn.close()
+
+
+def cache_put(fecha: str, compra: float, venta: float, source: str = "apis.net.pe") -> None:
+    """Inserta/actualiza una fila. Thin wrapper sobre `cache_put_many` (P1)."""
+    cache_put_many([(fecha, compra, venta, source)])
 
 
 def cache_count() -> int:
@@ -315,13 +374,29 @@ def fetch_day(day_str: str, *, use_cache: bool = True) -> list[dict]:
     if not data:
         return []
     rows = [n for n in (_normalize_item(x) for x in data) if n]
-    for r in rows:
-        cache_put(r["fecha"], r["compra"], r["venta"])
+    if rows:
+        cache_put_many([(r["fecha"], r["compra"], r["venta"]) for r in rows])
     return rows
 
 
-def fetch_month(year: int, month: int, *, use_cache: bool = True) -> list[dict]:
-    """Consulta un mes. Para meses pasados, sirve del cache si está completo."""
+def _fetch_month_with_flag(
+    year: int,
+    month: int,
+    *,
+    use_cache: bool = True,
+) -> tuple[list[dict], bool]:
+    """Consulta un mes y devuelve `(rows, network_happened)` (perf-cache-batching P3).
+
+    Lee el caché UNA vez (vía `cache_get_month`), aplica el umbral
+    `MIN_DAYS_FOR_CACHED_MONTH` y devuelve las filas junto con un flag que
+    indica si ocurrió una llamada de red. Esto reemplaza el patrón anterior
+    donde `fetch_range` pre-decidía con `_month_requires_network` (otra lectura
+    de caché) y luego llamaba `fetch_month` (que releía el caché).
+
+    `network_happened` es False sólo cuando el mes se sirve completo del caché;
+    en cualquier otro caso (caché desactivado, mes actual, caché incompleto o
+    respuesta de red vacía) es True, porque se hizo (o se intentó) una petición.
+    """
     v = validate_month(year, month)
     if isinstance(v, str):
         raise FetchError(kind="input", message=v)
@@ -331,13 +406,23 @@ def fetch_month(year: int, month: int, *, use_cache: bool = True) -> list[dict]:
     if use_cache and not is_current_month:
         cached = cache_get_month(year, month)
         if len(cached) >= MIN_DAYS_FOR_CACHED_MONTH:
-            return sorted(cached.values(), key=lambda x: x["fecha"])
+            return sorted(cached.values(), key=lambda x: x["fecha"]), False
     data = _get_with_retry({"year": year, "month": month})
     if not data:
-        return []
+        return [], True
     rows = [n for n in (_normalize_item(x) for x in data) if n]
-    for r in rows:
-        cache_put(r["fecha"], r["compra"], r["venta"])
+    if rows:
+        cache_put_many([(r["fecha"], r["compra"], r["venta"]) for r in rows])
+    return rows, True
+
+
+def fetch_month(year: int, month: int, *, use_cache: bool = True) -> list[dict]:
+    """Consulta un mes. Para meses pasados, sirve del cache si está completo.
+
+    Delega en `_fetch_month_with_flag` (P3) y devuelve sólo las filas,
+    preservando el contrato público existente (GUI/CLI/tests).
+    """
+    rows, _ = _fetch_month_with_flag(year, month, use_cache=use_cache)
     return rows
 
 
@@ -351,14 +436,16 @@ def fetch_range(
     """Consulta un rango recorriendo mes a mes.
 
     Atajo de cortesía: si el mes se sirve enteramente del caché (sin red),
-    se omite el sleep(0.3) trailing; si hubo red, sí se duerme.
+    se omite el `sleep` trailing; si hubo red, se duerme 0.1s (P4). La lectura
+    de caché por mes ocurre una sola vez dentro de `_fetch_month_with_flag` (P3).
     """
     v = validate_range(start, end)
     if isinstance(v, str):
         raise FetchError(kind="input", message=v)
     start, end = v
-    if end < start:
-        return []
+    # `validate_range` (arriba) is el único guard para `start > end`:
+    # raises FetchError(kind="input"). No hace falta un `if end < start: return []`
+    # post-validate — sería código muerto (fix-data-layer-bugs Q5).
     resultados: list[dict] = []
     y, m = start.year, start.month
     total_months = (end.year - start.year) * 12 + (end.month - start.month) + 1
@@ -371,8 +458,7 @@ def fetch_range(
                 f"Consultando {nombre} {y} ({month_idx}/{total_months})…",
                 len(resultados),
             )
-        network_happened = _month_requires_network(y, m, use_cache=use_cache)
-        meses = fetch_month(y, m, use_cache=use_cache)
+        meses, network_happened = _fetch_month_with_flag(y, m, use_cache=use_cache)
         for item in meses:
             try:
                 d = datetime.strptime(item["fecha"], "%Y-%m-%d").date()
@@ -385,25 +471,14 @@ def fetch_range(
         else:
             m += 1
         if network_happened:
-            time.sleep(0.3)  # cortesía
+            # apis.net.pe is a public free API; 0.1s stays polite. The backoff
+            # in _get_with_retry already handles 429/5xx. A 2-year full miss
+            # drops 7.2s -> 2.4s (perf-cache-batching P4).
+            time.sleep(0.1)
     resultados.sort(key=lambda x: x["fecha"])
     if on_progress:
         on_progress("Procesando resultados…", len(resultados))
     return resultados
-
-
-def _month_requires_network(year: int, month: int, *, use_cache: bool) -> bool:
-    """Predice si `fetch_month(year, month)` hará una llamada de red.
-
-    True cuando: caché desactivado, mes actual, o el caché tiene < MIN_DAYS_FOR_CACHED_MONTH días.
-    """
-    if not use_cache:
-        return True
-    today_d = date.today()
-    if year == today_d.year and month == today_d.month:
-        return True
-    cached = cache_get_month(year, month)
-    return len(cached) < MIN_DAYS_FOR_CACHED_MONTH
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +486,7 @@ def _month_requires_network(year: int, month: int, *, use_cache: bool) -> bool:
 # ---------------------------------------------------------------------------
 
 DEFAULT_STATE: dict = {
-    "geometry": "720x600",
+    "geometry": "850x600",
     "mode": "today",
     "range_start": None,
     "range_end": None,
@@ -424,15 +499,23 @@ def load_state() -> dict:
     if not STATE_FILE.exists():
         return dict(DEFAULT_STATE)
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
+        with open(STATE_FILE, encoding="utf-8") as f:
             data = json.load(f)
+        # Valid JSON is not enough — `state.json` could legitimately
+        # contain `5`, `null`, `[1,2,3]`, etc. if a user edits it by
+        # hand. `dict.update` would raise TypeError on any non-dict
+        # payload; defend with an explicit shape check (B4/D5) and a
+        # widened except tuple so the app keeps launching on a corrupt
+        # file instead of crashing.
+        if not isinstance(data, dict):
+            return dict(DEFAULT_STATE)
         merged = dict(DEFAULT_STATE)
         merged.update(data)
         # sane defaults en valores faltantes
         if not isinstance(merged.get("mode"), str):
             merged["mode"] = "today"
         return merged
-    except (OSError, json.JSONDecodeError, ValueError):
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
         return dict(DEFAULT_STATE)
 
 
