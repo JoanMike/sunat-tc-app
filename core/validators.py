@@ -13,7 +13,6 @@ from datetime import date
 
 # Constantes del dominio (clamp histórico + máximo dinámico).
 MIN_YEAR = 2000
-MIN_RANGE_DAYS = 1
 MAX_RANGE_DAYS = 730  # ≈ 2 años
 
 

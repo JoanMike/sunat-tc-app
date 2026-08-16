@@ -16,7 +16,7 @@ Funciones:
 Fuente de datos: https://api.apis.net.pe/v1/tipo-cambio-sunat
 (API pública que replica el tipo de cambio oficial publicado por SUNAT)
 
-La capa de datos vive en core.py; este archivo sólo contiene el GUI.
+La capa de datos vive en el paquete `core/`; este archivo sólo contiene el GUI.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ from core import (
     MAX_RANGE_DAYS,
     MIN_YEAR,
     MONTHS_ES,
+    STATE_FILE,
     FetchError,
     __version__,
     cache_clear,
@@ -55,6 +56,7 @@ from core import (
     load_state,
     max_year,
     save_state,
+    setup_logging,
 )
 
 # ---------------------------------------------------------------------------
@@ -432,8 +434,10 @@ class SunatTCApp:
         # so an entry keeping focus still gets native select-all-in-entry).
         self.tree.bind("<Control-a>", lambda e: self._select_all())
         self.tree.bind("<Control-A>", lambda e: self._select_all())
-        self.root.bind_all("<Control-e>", lambda e: self._export_excel())
-        self.root.bind_all("<Control-E>", lambda e: self._export_excel())
+        # Ctrl+E anclado al árbol (como Ctrl+C/A): con bind_all se disparaba
+        # incluso al teclear en los spinboxes de fecha.
+        self.tree.bind("<Control-e>", lambda e: self._export_excel())
+        self.tree.bind("<Control-E>", lambda e: self._export_excel())
 
         # Barra inferior
         bottom = ttk.Frame(self.root, padding=(12, 4, 12, 12))
@@ -574,7 +578,10 @@ class SunatTCApp:
                 self.state["year"] = int(self.year_spin.get())
             except (ValueError, tk.TclError):
                 pass
-        save_state(self.state)
+        if not save_state(self.state):
+            # Fallo de escritura al cerrar (disco lleno, permisos): no hay
+            # UI ya para avisar, pero debe quedar rastro en el log.
+            _logger.warning("No se pudo persistir el estado en %s", STATE_FILE)
         self.root.destroy()
 
     # -- caché ----------------------------------------------------------------
@@ -1040,69 +1047,13 @@ class SunatTCApp:
             return
 
         # T3.6: lazy import — `import app` must not load openpyxl. The
-        # XLSX-only path is the only one paying the cost.
-        from openpyxl import Workbook
-        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-        from openpyxl.utils import get_column_letter
+        # XLSX-only path is the only one paying the cost. El armado y
+        # estilo del workbook vive en core.excel.write_xlsx (compartido
+        # con el CLI).
+        from core.excel import write_xlsx
 
         try:
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Tipo de Cambio SUNAT"
-
-            # Estilos
-            header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-            header_fill = PatternFill("solid", fgColor="1F4E78")
-            header_align = Alignment(horizontal="center", vertical="center")
-            cell_font = Font(name="Calibri", size=11)
-            center = Alignment(horizontal="center", vertical="center")
-            right = Alignment(horizontal="right", vertical="center")
-            thin = Side(border_style="thin", color="BFBFBF")
-            border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-            # Cabecera
-            headers = ["Fecha", "Compra (S/)", "Venta (S/)"]
-            ws.append(headers)
-            for col_idx, _ in enumerate(headers, start=1):
-                c = ws.cell(row=1, column=col_idx)
-                c.font = header_font
-                c.fill = header_fill
-                c.alignment = header_align
-                c.border = border
-
-            # Filas
-            for r in self.data:
-                fecha_iso = r["fecha"][:10]
-                try:
-                    fecha_obj = datetime.strptime(fecha_iso, "%Y-%m-%d").date()
-                except ValueError:
-                    fecha_obj = fecha_iso
-                ws.append([fecha_obj, float(r["compra"]), float(r["venta"])])
-
-            # Formato de columnas
-            last_row = ws.max_row
-            for row_idx in range(2, last_row + 1):
-                ws.cell(row=row_idx, column=1).number_format = "DD/MM/YYYY"
-                ws.cell(row=row_idx, column=1).alignment = center
-                ws.cell(row=row_idx, column=1).font = cell_font
-                ws.cell(row=row_idx, column=1).border = border
-
-                for col_idx in (2, 3):
-                    c = ws.cell(row=row_idx, column=col_idx)
-                    c.number_format = "0.0000"
-                    c.alignment = right
-                    c.font = cell_font
-                    c.border = border
-
-            # Anchos
-            widths = (16, 16, 16)
-            for col_idx, w in enumerate(widths, start=1):
-                ws.column_dimensions[get_column_letter(col_idx)].width = w
-
-            # Congelar la cabecera
-            ws.freeze_panes = "A2"
-
-            wb.save(filename)
+            write_xlsx(self.data, filename)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Error al exportar", f"No se pudo guardar el archivo:\n{exc}")
             return
@@ -1126,6 +1077,7 @@ def main() -> None:
     if len(sys.argv) > 1:
         from cli import run
         sys.exit(run(sys.argv[1:]))
+    setup_logging()
     root = tk.Tk()
     SunatTCApp(root)
     root.mainloop()

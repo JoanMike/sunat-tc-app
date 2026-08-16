@@ -31,7 +31,16 @@ if not exist "venv\Scripts\python.exe" (
         pause
         exit /b 1
     )
-    call venv\Scripts\activate.bat
+)
+
+call venv\Scripts\activate.bat
+
+REM Reinstala dependencias si requirements.txt cambio desde la ultima
+REM instalacion. Tras instalar se guarda una copia de requirements.txt
+REM dentro del venv como sello; fc /b compara contenido (falla tambien
+REM si el sello no existe, p. ej. venv recien creado).
+fc /b requirements.txt "venv\.installed-requirements.txt" >nul 2>nul
+if errorlevel 1 (
     echo Instalando dependencias...
     pip install -r requirements.txt
     if errorlevel 1 (
@@ -39,8 +48,7 @@ if not exist "venv\Scripts\python.exe" (
         pause
         exit /b 1
     )
-) else (
-    call venv\Scripts\activate.bat
+    copy /y requirements.txt "venv\.installed-requirements.txt" >nul
 )
 
 %PY% app.py %*

@@ -39,6 +39,7 @@ from core import (
     fetch_month,
     fetch_range,
     format_fetch_error,
+    setup_logging,
     validate_month,
     validate_range,
 )
@@ -77,15 +78,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "--month", metavar="YYYY-MM", help="Mes completo en formato YYYY-MM"
     )
 
-    # Output options
+    # Output options (mutually exclusive: combining --json with --csv/--xlsx
+    # used to silently ignore the file flags; argparse now rejects it with
+    # exit code 2).
     out = p.add_argument_group("salida")
-    out.add_argument(
+    out_mx = out.add_mutually_exclusive_group()
+    out_mx.add_argument(
         "--json", action="store_true", help="Imprimir resultado en JSON a stdout"
     )
-    out.add_argument(
+    out_mx.add_argument(
         "--csv", metavar="ARCHIVO", help="Guardar resultado como CSV en ARCHIVO"
     )
-    out.add_argument(
+    out_mx.add_argument(
         "--xlsx", metavar="ARCHIVO", help="Guardar resultado como Excel en ARCHIVO"
     )
 
@@ -139,65 +143,12 @@ def _save_csv(rows: list[dict], path: str) -> None:
 
 def _save_xlsx(rows: list[dict], path: str) -> None:
     # Lazy import: keeps the cli module cheap for JSON/CSV/--help paths
-    # and the import surface free of openpyxl (app-startup-and-imports R1, S11).
-    from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-    from openpyxl.utils import get_column_letter
+    # and the import surface free of openpyxl (app-startup-and-imports R1,
+    # S11). The workbook building/styling lives in core.excel.write_xlsx,
+    # shared with the GUI export.
+    from core.excel import write_xlsx
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Tipo de Cambio SUNAT"
-
-    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    header_align = Alignment(horizontal="center", vertical="center")
-    cell_font = Font(name="Calibri", size=11)
-    center = Alignment(horizontal="center", vertical="center")
-    right = Alignment(horizontal="right", vertical="center")
-    thin = Side(border_style="thin", color="BFBFBF")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    headers = ["Fecha", "Compra (S/)", "Venta (S/)"]
-    ws.append(headers)
-    for col_idx, _ in enumerate(headers, start=1):
-        c = ws.cell(row=1, column=col_idx)
-        c.font = header_font
-        c.fill = header_fill
-        c.alignment = header_align
-        c.border = border
-
-    for r in rows:
-        # Defend against a malformed `fecha` (theoretically possible after
-        # manual DB edits or a future API change). Mirror `app.py:916-919`:
-        # fall back to the raw string instead of crashing the export.
-        # The outer `try/except (OSError, ValueError, TypeError)` below
-        # converts any remaining error into the documented exit code 5.
-        try:
-            fecha_obj = datetime.strptime(r["fecha"], "%Y-%m-%d").date()
-        except ValueError:
-            fecha_obj = r["fecha"]
-        ws.append([fecha_obj, float(r["compra"]), float(r["venta"])])
-
-    last_row = ws.max_row
-    for row_idx in range(2, last_row + 1):
-        c1 = ws.cell(row=row_idx, column=1)
-        c1.number_format = "DD/MM/YYYY"
-        c1.alignment = center
-        c1.font = cell_font
-        c1.border = border
-        for col_idx in (2, 3):
-            c = ws.cell(row=row_idx, column=col_idx)
-            c.number_format = "0.0000"
-            c.alignment = right
-            c.font = cell_font
-            c.border = border
-
-    widths = (16, 16, 16)
-    for col_idx, w in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = w
-
-    ws.freeze_panes = "A2"
-    wb.save(path)
+    write_xlsx(rows, path)
 
 
 # Mapping from FetchError.kind to a user-facing Spanish message moved to
@@ -209,6 +160,10 @@ def run(argv: list[str] | None = None) -> int:
     """Punto de entrada. Devuelve un código de salida."""
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    # Logging a archivo rotativo (idempotente). Va después de parse_args
+    # para que --help/--version salgan sin tocar el disco.
+    setup_logging()
 
     # --- comandos que no requieren query ----------------------------------
     if args.clear_cache:

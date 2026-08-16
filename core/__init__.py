@@ -19,8 +19,10 @@ Estado persistido (JSON en %APPDATA%/sunat-tc-app/state.json):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
+import re
 import sqlite3
 import time
 from collections.abc import Iterable
@@ -52,6 +54,16 @@ from .validators import MAX_RANGE_DAYS, MIN_YEAR, validate_month, validate_range
 API_BASE = "https://api.apis.net.pe/v1/tipo-cambio-sunat"
 HTTP_TIMEOUT = 15  # segundos
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+# Logger de la capa de datos. Hijo de "sunat_tc_app" (app.py); el handler
+# a archivo lo instala setup_logging() desde los entry points.
+_logger = logging.getLogger("sunat_tc_app.core")
+
+# Fechas ISO estrictas (YYYY-MM-DD). _normalize_item rechaza cualquier otra
+# cosa antes de que llegue al caché o a los exports CSV/XLSX — un string
+# que empiece por =, +, - o @ sería ejecutado por Excel como fórmula
+# (hardening contra CSV/formula injection vía la API upstream).
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def max_year() -> int:
@@ -99,6 +111,33 @@ CACHE_DB: Path = _app_data_dir() / "cache.db"
 STATE_FILE: Path = _app_data_dir() / "state.json"
 
 
+def setup_logging(level: int = logging.INFO) -> None:
+    """Adjunta un handler de archivo rotativo al logger raíz de la app.
+
+    Idempotente: si ya hay un RotatingFileHandler instalado, no añade otro
+    (los tests llaman a los entry points muchas veces por sesión). El log
+    vive junto a state.json (`STATE_FILE.parent`), así los tests que
+    parchean STATE_FILE a un tmp_path no escriben en el %APPDATA% real.
+    Lo llaman los entry points (`app.main`, `cli.run`); importar el módulo
+    no tiene side effects de logging.
+    """
+    from logging.handlers import RotatingFileHandler
+
+    logger = logging.getLogger("sunat_tc_app")
+    if any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+        return
+    log_dir = STATE_FILE.parent
+    log_dir.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        log_dir / "app.log", maxBytes=512_000, backupCount=2, encoding="utf-8"
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    logger.addHandler(handler)
+    logger.setLevel(level)
+
+
 # ---------------------------------------------------------------------------
 # Normalización / HTTP
 # ---------------------------------------------------------------------------
@@ -117,9 +156,14 @@ def _normalize_item(item: dict) -> dict | None:
         venta = item.get("sellPrice")
     if not fecha or compra is None or venta is None:
         return None
+    fecha_str = str(fecha)[:10]
+    # Rechazo temprano de fechas no-ISO (ver _ISO_DATE_RE): evita que un
+    # string hostil llegue verbatim a los exports CSV/XLSX.
+    if not _ISO_DATE_RE.match(fecha_str):
+        return None
     try:
         return {
-            "fecha": str(fecha)[:10],
+            "fecha": fecha_str,
             "compra": float(compra),
             "venta": float(venta),
         }
@@ -148,7 +192,15 @@ def _get_with_retry(params: dict, max_retries: int = 3) -> list[dict]:
             r = requests.get(API_BASE, params=params, timeout=HTTP_TIMEOUT)
         except requests.RequestException as exc:
             if attempt == max_retries - 1:
+                _logger.error(
+                    "GET %s %s: red agotada tras %d intentos: %s",
+                    API_BASE, params, max_retries, exc,
+                )
                 raise FetchError(kind="network", message=str(exc)) from exc
+            _logger.warning(
+                "GET %s %s: intento %d/%d falló (%s); reintento en %.1fs",
+                API_BASE, params, attempt + 1, max_retries, exc, delay,
+            )
             time.sleep(delay + random.uniform(0, delay))
             delay *= 2
             continue
@@ -156,6 +208,10 @@ def _get_with_retry(params: dict, max_retries: int = 3) -> list[dict]:
             return []
         if r.status_code in RETRYABLE_STATUS:
             if attempt == max_retries - 1:
+                _logger.error(
+                    "GET %s %s: HTTP %d persistente tras %d intentos",
+                    API_BASE, params, r.status_code, max_retries,
+                )
                 # 429 (rate limit) stays in RETRYABLE_STATUS so it benefits
                 # from the existing exponential-backoff schedule, but the
                 # terminal FetchError.kind is "rate_limit" so callers can
@@ -173,11 +229,18 @@ def _get_with_retry(params: dict, max_retries: int = 3) -> list[dict]:
                     message=f"HTTP {r.status_code}",
                     status=r.status_code,
                 )
+            _logger.warning(
+                "GET %s %s: HTTP %d (intento %d/%d); reintento en %.1fs",
+                API_BASE, params, r.status_code, attempt + 1, max_retries, delay,
+            )
             time.sleep(delay + random.uniform(0, delay))
             delay *= 2
             continue
         if r.status_code >= 400:
             kind = "http_4xx" if r.status_code < 500 else "http_5xx"
+            _logger.error(
+                "GET %s %s: HTTP %d no reintentable", API_BASE, params, r.status_code
+            )
             raise FetchError(
                 kind=kind,
                 message=f"HTTP {r.status_code}",

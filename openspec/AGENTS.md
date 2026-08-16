@@ -25,12 +25,15 @@ sunat-tc-app/
 │   ├── errors.py       # FetchError + kind constants
 │   ├── locale.py       # MONTHS_ES, MONTHS_ABBR_ES
 │   ├── validators.py   # validate_range, validate_month, MIN_YEAR, MAX_RANGE_DAYS
-│   └── messages.py     # format_fetch_error (Spanish FetchError mapper)
-├── tests/          # Pytest suite (63 tests)
+│   ├── messages.py     # format_fetch_error (Spanish FetchError mapper)
+│   └── excel.py        # write_xlsx (shared styled XLSX export; openpyxl lazy)
+├── tests/          # Pytest suite (84 tests)
 ├── requirements.txt
-├── requirements-dev.txt  # pytest, pytest-mock, requests-mock
+├── requirements-dev.txt  # pytest, pytest-mock, requests-mock, ruff
 ├── pytest.ini      # Pytest config
+├── ruff.toml       # Ruff linter config (E/W/F/I/UP/B/SIM, py39, line-length 100)
 ├── run.bat         # Windows launcher: creates venv, installs deps, dispatches app.py
+├── LICENSE         # MIT
 ├── README.md
 ├── .gitignore      # Ignores venv, .atl/, runtime XLSX exports
 ├── venv/           # Local virtualenv (gitignored)
@@ -52,8 +55,9 @@ sunat-tc-app/
 | `core/locale.py` | `—` | `MONTHS_ES`, `MONTHS_ABBR_ES` | None |
 | `core/validators.py` | `datetime` | `validate_range`, `validate_month`, `MIN_YEAR`, `MAX_RANGE_DAYS` | None |
 | `core/messages.py` | `core.errors` | `format_fetch_error` | None |
-| `cli.py` | `argparse`, `csv`, `json`, `core` (openpyxl lazy in `_save_xlsx`) | `run(argv)`, `main()` | stdout/stderr, file writes (CSV/XLSX) |
-| `app.py` | `tkinter`, `queue`, `threading`, `core`, `cli` (openpyxl lazy in `_export_excel`) | `SunatTCApp`, `DateEntry`, `main()` | Tk window, clipboard, XLSX export, background worker threads |
+| `core/excel.py` | `openpyxl` (lazy, inside `write_xlsx`) | `write_xlsx` | XLSX write on call |
+| `cli.py` | `argparse`, `csv`, `json`, `core` (openpyxl lazy vía `core.excel`) | `run(argv)`, `main()` | stdout/stderr, file writes (CSV/XLSX) |
+| `app.py` | `tkinter`, `queue`, `threading`, `core`, `cli` (openpyxl lazy vía `core.excel`) | `SunatTCApp`, `DateEntry`, `main()` | Tk window, clipboard, XLSX export, background worker threads |
 
 `core/` is the only package that touches the network or persistent disk. GUI and CLI both
 consume it.
@@ -73,9 +77,9 @@ consume it.
 
 ## Testing capabilities
 
-- **Test runner**: pytest (`pytest -q`, 63 tests passing).
+- **Test runner**: pytest (`pytest -q`, 84 tests passing).
 - **Coverage**: not measured.
-- **Linter / type checker / formatter**: NONE (planned for a future change).
+- **Linter**: ruff (`ruff check .`, config en `ruff.toml`: E/W/F/I/UP/B/SIM, py39). Sin type checker ni formatter.
 - **`strict_tdd`**: `true` (in `config.yaml`).
 
 ## Persistence

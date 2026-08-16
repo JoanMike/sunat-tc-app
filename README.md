@@ -28,13 +28,15 @@ sunat-tc-app/
 │   ├── errors.py      # FetchError tipado
 │   ├── locale.py      # MONTHS_ES / MONTHS_ABBR_ES
 │   ├── validators.py  # validate_range / validate_month + constantes MIN_YEAR/MAX_RANGE_DAYS
-│   └── messages.py    # format_fetch_error (mapeador Spanish de FetchError)
-├── tests/             # Suite pytest (63 tests)
+│   ├── messages.py    # format_fetch_error (mapeador Spanish de FetchError)
+│   └── excel.py       # write_xlsx — export Excel compartido (CLI + GUI)
+├── tests/             # Suite pytest (84 tests)
 ├── openspec/          # Workspace SDD (specs + changes)
 ├── requirements.txt   # requests, openpyxl
-├── requirements-dev.txt  # pytest, pytest-mock, requests-mock
+├── requirements-dev.txt  # pytest, pytest-mock, requests-mock, ruff
 ├── pytest.ini
 ├── run.bat            # Lanzador para Windows
+├── LICENSE            # MIT
 └── README.md
 ```
 
@@ -123,8 +125,7 @@ python app.py --clear-cache
 
 | Código | Significado |
 |---|---|
-| 0 | OK |
-| 0 | --help (ayuda mostrada y salida) |
+| 0 | OK (también `--help` y `--version`) |
 | 1 | Sin argumentos (ningún flag de consulta) |
 | 2 | Argumentos inválidos |
 | 3 | No se encontraron datos |
@@ -181,6 +182,7 @@ cualquier lenguaje.
 | `core/locale.py` | `MONTHS_ES` / `MONTHS_ABBR_ES` para la UI en español. |
 | `core/validators.py` | `validate_range` / `validate_month` + constantes `MIN_YEAR` / `MAX_RANGE_DAYS`. |
 | `core/messages.py` | `format_fetch_error` — mapeador de `FetchError` a mensajes en español. |
+| `core/excel.py` | `write_xlsx` — exportación Excel con formato, compartida por CLI y GUI (openpyxl lazy). |
 | `app.py` | GUI: `DateEntry`, `SunatTCApp`, filtros rápidos, exporte Excel. Despacha a CLI si hay argv. |
 | `cli.py` | argparse, salida en stdout/JSON/CSV/XLSX, sub-comandos de caché. |
 
@@ -192,3 +194,5 @@ cualquier lenguaje.
   última fecha publicada o un set parcial para el mes/rango.
 - Para fechas anteriores a 2000 la API no tiene datos.
 - La aplicación maneja errores de red reintentando con backoff (3 intentos).
+- Los reintentos y errores de red/HTTP se registran en
+  `%APPDATA%\sunat-tc-app\app.log` (rotativo, 512 KB × 3 archivos).
