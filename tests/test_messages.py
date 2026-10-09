@@ -74,6 +74,17 @@ def test_format_fetch_error_rate_limit():
     ), f"expected a Spanish rate-limit message; got {out!r}"
 
 
+def test_format_fetch_error_auth():
+    """kind='auth' must map to a Spanish token message (API v2)."""
+    exc = FetchError(kind="auth", message="HTTP 401", status=401)
+    out = format_fetch_error(exc)
+    assert out, "format_fetch_error must return a non-empty string"
+    assert any(
+        marker in out.lower()
+        for marker in ("token", "rechaz", "configur", "inv")
+    ), f"expected a Spanish token message; got {out!r}"
+
+
 def test_format_fetch_error_input():
     """kind='input' must map to a Spanish 'invalid parameters' message."""
     exc = FetchError(kind="input", message="bad arg")

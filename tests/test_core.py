@@ -203,12 +203,18 @@ def test_cache_put_still_works_single_row(tmp_cache_dir):
 
 
 def test_fetch_month_batches_cache_writes(monkeypatch, tmp_cache_dir):
-    """fetch_month must write a multi-row network response via one cache_put_many call."""
+    """fetch_month must write the network response via one cache_put_many call.
+
+    La API no soporta `?month=&year=`, así que el mes se pide día a día con
+    `?fecha=`; el mock devuelve las 20 filas para cualquier día y el filtro
+    de fecha estricto deja exactamente esas 20, escritas en un solo batch.
+    """
     rows_data = [
         {"fecha": f"2024-01-{d:02d}", "compra": 3.70, "venta": 3.75}
         for d in range(1, 21)
     ]
     monkeypatch.setattr(core, "_get_with_retry", lambda params, **kw: rows_data)
+    monkeypatch.setattr(core.time, "sleep", lambda _d: None)
     calls: list = []
     monkeypatch.setattr(
         core, "cache_put_many", lambda *a, **k: calls.append(a), raising=False
@@ -217,6 +223,109 @@ def test_fetch_month_batches_cache_writes(monkeypatch, tmp_cache_dir):
     assert len(calls) == 1, (
         f"fetch_month must call cache_put_many once for a 20-row response, "
         f"got {len(calls)}"
+    )
+
+
+def test_fetch_month_requests_each_day_via_fecha(monkeypatch, tmp_cache_dir):
+    """El mes se pide día a día con `?fecha=` (la API v1 no soporta month/year)."""
+    asked: list[dict] = []
+
+    def fake_get(params, **kw):
+        asked.append(params)
+        return [{"fecha": params["fecha"], "compra": 3.70, "venta": 3.75}]
+
+    monkeypatch.setattr(core, "_get_with_retry", fake_get)
+    monkeypatch.setattr(core.time, "sleep", lambda _d: None)
+
+    rows = core.fetch_month(2024, 1)
+
+    assert len(asked) == 31, f"enero tiene 31 días, got {asked}"
+    assert asked[0] == {"fecha": "2024-01-01"}
+    assert asked[-1] == {"fecha": "2024-01-31"}
+    assert [r["fecha"] for r in rows] == [f"2024-01-{d:02d}" for d in range(1, 32)]
+
+
+def test_fetch_month_discards_wrong_date_payloads(monkeypatch, tmp_cache_dir):
+    """Una respuesta "de hoy" que ignore `fecha` no debe colarse ni cachearse.
+
+    Regresión del bug reportado: `?month=&year=` devolvía sólo el TC de hoy.
+    Si la API ignorara también `fecha`, `fetch_month` debe devolver [] en vez
+    de mostrar/cachear el TC de hoy bajo otro mes.
+    """
+    today_row = {"fecha": date.today().isoformat(), "compra": 3.44, "venta": 3.45}
+    monkeypatch.setattr(core, "_get_with_retry", lambda params, **kw: [today_row])
+    monkeypatch.setattr(core.time, "sleep", lambda _d: None)
+    put_calls: list = []
+    monkeypatch.setattr(core, "cache_put_many", lambda *a, **k: put_calls.append(a))
+
+    rows = core.fetch_month(2024, 1)  # enero 2024 nunca es "hoy"
+
+    assert rows == [], f"filas con fecha ajena deben descartarse, got {rows}"
+    assert put_calls == [], "no debe cachearse una fila con fecha equivocada"
+
+
+def test_fetch_month_reuses_cached_days_and_fetches_missing(monkeypatch, tmp_cache_dir):
+    """Los días ya cacheados no se re-piden; sólo los faltantes van a la red."""
+    core.cache_put("2024-01-05", 3.70, 3.75)
+    core.cache_put("2024-01-20", 3.71, 3.76)
+    asked: list[str] = []
+
+    def fake_get(params, **kw):
+        asked.append(params["fecha"])
+        return [{"fecha": params["fecha"], "compra": 3.70, "venta": 3.75}]
+
+    monkeypatch.setattr(core, "_get_with_retry", fake_get)
+    monkeypatch.setattr(core.time, "sleep", lambda _d: None)
+
+    rows = core.fetch_month(2024, 1)
+
+    assert "2024-01-05" not in asked and "2024-01-20" not in asked, (
+        f"días cacheados no deben re-pedirse, asked={asked}"
+    )
+    assert len(asked) == 29, f"31 días - 2 cacheados = 29 peticiones, got {asked}"
+    assert len(rows) == 31
+    assert [r["fecha"] for r in rows] == [f"2024-01-{d:02d}" for d in range(1, 32)]
+
+
+def test_fetch_month_always_refetches_today(monkeypatch, tmp_cache_dir):
+    """El día de hoy se re-consulta a la red aunque esté cacheado."""
+    today = date.today()
+    core.cache_put(today.isoformat(), 1.0, 1.1)
+    asked: list[str] = []
+
+    def fake_get(params, **kw):
+        asked.append(params["fecha"])
+        return [{"fecha": params["fecha"], "compra": 3.44, "venta": 3.45}]
+
+    monkeypatch.setattr(core, "_get_with_retry", fake_get)
+    monkeypatch.setattr(core.time, "sleep", lambda _d: None)
+
+    rows = core.fetch_month(today.year, today.month)
+
+    assert today.isoformat() in asked, "hoy debe re-consultarse a la red"
+    hoy = [r for r in rows if r["fecha"] == today.isoformat()]
+    assert hoy and hoy[0]["compra"] == 3.44, (
+        f"hoy debe reflejar el valor fresco de la red, got {hoy}"
+    )
+
+
+def test_fetch_month_paces_network_requests(monkeypatch, tmp_cache_dir):
+    """Entre peticiones de red consecutivas se espera DAY_REQUEST_DELAY (429-safe)."""
+    monkeypatch.setattr(core, "DAY_REQUEST_DELAY", 1.5)
+    monkeypatch.setattr(
+        core,
+        "_get_with_retry",
+        lambda params, **kw: [
+            {"fecha": params["fecha"], "compra": 3.7, "venta": 3.8}
+        ],
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(core.time, "sleep", lambda d: sleeps.append(d))
+
+    core.fetch_month(2024, 2)  # 29 días -> 28 esperas entre peticiones
+
+    assert sleeps == [1.5] * 28, (
+        f"debe esperar entre peticiones consecutivas (n-1 veces), got {sleeps}"
     )
 
 
@@ -307,7 +416,7 @@ def test_connect_runs_ddl_when_db_missing(monkeypatch, tmp_cache_dir):
 
 def test_fetch_range_cache_hit_skips_sleep(monkeypatch, tmp_cache_dir):
     """When a month is fully cached, fetch_range must not call time.sleep."""
-    # Pre-populate cache for January 2024 (20 days > MIN_DAYS_FOR_CACHED_MONTH=15)
+    # Pre-populate cache for January 2024 (la ventana 1-15 queda completa)
     y, m = 2024, 1
     for d in range(1, 21):
         day_str = f"{y:04d}-{m:02d}-{d:02d}"
@@ -343,7 +452,7 @@ def test_fetch_range_reads_cache_once_per_month(monkeypatch, tmp_cache_dir):
     `cache_get_month`, and assert exactly one read for that month.
     """
     y, m = 2024, 1
-    for d in range(1, 21):  # 20 days > MIN_DAYS_FOR_CACHED_MONTH=15 -> cache hit
+    for d in range(1, 21):  # los 15 días de la ventana quedan cacheados
         core.cache_put(f"{y:04d}-{m:02d}-{d:02d}", 3.70, 3.75)
 
     calls: list = []
@@ -364,20 +473,47 @@ def test_fetch_range_reads_cache_once_per_month(monkeypatch, tmp_cache_dir):
 
 
 def test_fetch_range_sleeps_0_1s_on_network_month(monkeypatch, tmp_cache_dir):
-    """A network-served month must sleep 0.1s (not 0.3s) in fetch_range (P4)."""
+    """A network-served month must sleep 0.1s (not 0.3s) in fetch_range (P4).
+
+    Además del trailing de 0.1s por mes con red, el fetch día a día espera
+    `DAY_REQUEST_DELAY` entre peticiones consecutivas (429-safe).
+    """
     rows_data = [
         {"fecha": f"2024-01-{d:02d}", "compra": 3.70, "venta": 3.75}
         for d in range(1, 21)
     ]
     monkeypatch.setattr(core, "_get_with_retry", lambda params, **kw: rows_data)
-    sleep_calls: list = []
-    monkeypatch.setattr(core.time, "sleep", lambda d: sleep_calls.append(d))
+    monkeypatch.setattr(core, "DAY_REQUEST_DELAY", 1.5)
+    sleeps: list[float] = []
+    monkeypatch.setattr(core.time, "sleep", lambda d: sleeps.append(d))
 
     core.fetch_range(date(2024, 1, 1), date(2024, 1, 15))
 
-    assert sleep_calls == [0.1], (
-        f"network month must sleep exactly 0.1s, got {sleep_calls}"
+    assert sleeps[-1] == 0.1, (
+        f"network month must sleep exactly 0.1s after the month, got {sleeps}"
     )
+    assert sleeps.count(1.5) == 14, (
+        f"15 días de red -> 14 esperas de pacing, got {sleeps}"
+    )
+
+
+def test_fetch_range_fetches_only_days_in_range(monkeypatch, tmp_cache_dir):
+    """Un rango corto no debe pedir el mes completo a la red."""
+    asked: list[str] = []
+
+    def fake_get(params, **kw):
+        asked.append(params["fecha"])
+        return [{"fecha": params["fecha"], "compra": 3.70, "venta": 3.75}]
+
+    monkeypatch.setattr(core, "_get_with_retry", fake_get)
+    monkeypatch.setattr(core.time, "sleep", lambda _d: None)
+
+    rows = core.fetch_range(date(2024, 1, 10), date(2024, 1, 12))
+
+    assert asked == ["2024-01-10", "2024-01-11", "2024-01-12"], (
+        f"sólo los 3 días del rango deben ir a la red, got {asked}"
+    )
+    assert [r["fecha"] for r in rows] == ["2024-01-10", "2024-01-11", "2024-01-12"]
 
 
 # ---------------------------------------------------------------------------
@@ -601,3 +737,171 @@ def test_core_has_version():
     """`core.__version__` SHALL be the single source of truth for the app
     version (app-startup-and-imports delta, Q8 / D4)."""
     assert core.__version__ == "1.0.0"
+
+
+# ---------------------------------------------------------------------------
+# Token de la API v2 (config.json + SUNAT_TC_TOKEN) y shapes de normalización
+# ---------------------------------------------------------------------------
+
+
+def test_token_roundtrip_in_config_file(tmp_cache_dir):
+    """save_token/load_token persisten en config.json (y "" lo borra)."""
+    assert core.load_token() is None, "sin config.json no hay token"
+    assert core.save_token("sk_test.abc") is True
+    assert core.load_token() == "sk_test.abc"
+    assert core.save_token("") is True
+    assert core.load_token() is None, "un token vacío borra la entrada"
+
+
+def test_get_api_token_env_overrides_file(monkeypatch, tmp_cache_dir):
+    """SUNAT_TC_TOKEN (entorno) tiene prioridad sobre config.json."""
+    core.save_token("from-file")
+    monkeypatch.setenv("SUNAT_TC_TOKEN", "from-env")
+    assert core.get_api_token() == "from-env"
+    monkeypatch.delenv("SUNAT_TC_TOKEN")
+    assert core.get_api_token() == "from-file"
+
+
+def test_load_token_corrupt_config_returns_none(tmp_cache_dir):
+    """Un config.json inválido no debe romper la app: devuelve None."""
+    core.CONFIG_FILE.write_text("{no es json", encoding="utf-8")
+    assert core.load_token() is None
+
+
+def test_normalize_v2_decolecta_shape():
+    """Shape v2 decolecta: date/buy_price/sell_price (strings) se normaliza."""
+    item = {"date": "2026-09-15", "buy_price": "3.373", "sell_price": "3.383"}
+    assert core._normalize_item(item) == {
+        "fecha": "2026-09-15",
+        "compra": 3.373,
+        "venta": 3.383,
+    }
+
+
+def test_normalize_v2_apisnet_shape():
+    """Shape v2 api.apis.net.pe: fecha/precioCompra/precioVenta se normaliza."""
+    item = {"fecha": "2026-09-15", "precioCompra": 3.373, "precioVenta": 3.383}
+    assert core._normalize_item(item) == {
+        "fecha": "2026-09-15",
+        "compra": 3.373,
+        "venta": 3.383,
+    }
+
+
+def test_fetch_month_uses_v2_single_request_with_token(monkeypatch, tmp_cache_dir):
+    """Con token, el mes llega en UNA petición v2 (sin bucle día a día)."""
+    monkeypatch.setenv("SUNAT_TC_TOKEN", "sk_test")
+    calls: list = []
+
+    def fake_v2(params, token, **kw):
+        calls.append((params, token))
+        return [
+            {"date": f"2024-01-{d:02d}", "buy_price": "3.70", "sell_price": "3.75"}
+            for d in range(1, 32)
+        ]
+
+    monkeypatch.setattr(core, "_get_v2_with_retry", fake_v2)
+    monkeypatch.setattr(
+        core,
+        "_get_with_retry",
+        lambda *a, **k: pytest.fail("con token no debe usarse la API v1"),
+    )
+
+    rows = core.fetch_month(2024, 1)
+
+    assert calls == [({"year": 2024, "month": 1}, "sk_test")], (
+        f"debe ser 1 petición v2 con month/year, got {calls}"
+    )
+    assert len(rows) == 31
+    assert rows[0] == {"fecha": "2024-01-01", "compra": 3.70, "venta": 3.75}
+
+
+def test_fetch_month_v2_discards_days_outside_window(monkeypatch, tmp_cache_dir):
+    """v2: días fuera de la ventana (otro mes, futuro) se descartan."""
+    monkeypatch.setenv("SUNAT_TC_TOKEN", "sk_test")
+    monkeypatch.setattr(
+        core,
+        "_get_v2_with_retry",
+        lambda params, token, **kw: [
+            {"date": "2023-12-31", "buy_price": 3.6, "sell_price": 3.65},
+            {"date": "2024-01-05", "buy_price": 3.7, "sell_price": 3.75},
+            {"date": "2024-02-01", "buy_price": 3.8, "sell_price": 3.85},
+        ],
+    )
+
+    rows = core.fetch_month(2024, 1)
+
+    assert [r["fecha"] for r in rows] == ["2024-01-05"]
+
+
+def test_fetch_month_v2_cache_hit_skips_network(monkeypatch, tmp_cache_dir):
+    """v2: ventana completamente cacheada -> sin red y sin pacing."""
+    for d in range(1, 32):
+        core.cache_put(f"2024-01-{d:02d}", 3.70, 3.75)
+    monkeypatch.setenv("SUNAT_TC_TOKEN", "sk_test")
+    monkeypatch.setattr(
+        core,
+        "_get_v2_with_retry",
+        lambda *a, **k: pytest.fail("ventana cacheada no debe ir a la red"),
+    )
+    sleeps: list = []
+    monkeypatch.setattr(core.time, "sleep", lambda d: sleeps.append(d))
+
+    rows = core.fetch_month(2024, 1)
+
+    assert len(rows) == 31, "la ventana completa se sirve del caché"
+    assert sleeps == [], "un cache-hit no debe dormir"
+
+
+def test_fetch_month_v2_auth_error(monkeypatch, tmp_cache_dir):
+    """401/403 de la v2 -> FetchError(kind='auth') sin reintentos."""
+    monkeypatch.setenv("SUNAT_TC_TOKEN", "sk_bad")
+    with requests_mock.Mocker() as m:
+        m.get(
+            core.API_V2_BASE,
+            status_code=401,
+            json={"error": "Apikey Required"},
+        )
+        with pytest.raises(core.FetchError) as exc_info:
+            core.fetch_month(2024, 1)
+    assert exc_info.value.kind == "auth"
+    assert exc_info.value.status == 401
+
+
+def test_check_token_verdicts(tmp_cache_dir):
+    """check_token: True aceptado / False rechazado / None no verificable."""
+    with requests_mock.Mocker() as m:
+        m.get(
+            core.API_V2_BASE,
+            status_code=200,
+            json={"date": "2026-10-09", "buy_price": 3.4, "sell_price": 3.5},
+        )
+        assert core.check_token("sk_ok") is True
+
+        m.get(core.API_V2_BASE, status_code=401, json={"error": "bad token"})
+        assert core.check_token("sk_bad") is False
+
+        m.get(core.API_V2_BASE, exc=requests.exceptions.ConnectionError)
+        assert core.check_token("sk_offline") is None
+
+
+def test_fetch_day_ignores_token_and_uses_v1(monkeypatch, tmp_cache_dir):
+    """El día suelto sigue por la v1 pública aunque haya token (igual de rápido)."""
+    monkeypatch.setenv("SUNAT_TC_TOKEN", "sk_test")
+    asked: list = []
+
+    def fake_v1(params, **kw):
+        asked.append(params)
+        return [{"fecha": params["fecha"], "compra": 3.7, "venta": 3.8}]
+
+    monkeypatch.setattr(core, "_get_with_retry", fake_v1)
+    monkeypatch.setattr(
+        core,
+        "_get_v2_with_retry",
+        lambda *a, **k: pytest.fail("fetch_day no debe usar la v2"),
+    )
+
+    rows = core.fetch_day("2024-01-15")
+
+    assert asked == [{"fecha": "2024-01-15"}]
+    assert rows == [{"fecha": "2024-01-15", "compra": 3.7, "venta": 3.8}]

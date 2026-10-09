@@ -27,6 +27,10 @@ _FETCH_ERROR_MESSAGES_ES: dict[str, str] = {
         "Demasiadas solicitudes al servicio de SUNAT. Espere un momento e "
         "intente de nuevo."
     ),
+    "auth": (
+        "La API rechazó el token configurado (inválido, vencido o sin cuota). "
+        "Verifíquelo en «Configurar token…» e intente de nuevo."
+    ),
     "input": "Parámetros de consulta inválidos.",
 }
 

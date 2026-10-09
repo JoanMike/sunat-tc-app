@@ -1,10 +1,19 @@
 """
-Capa de datos para sunat-tc-app: fetching, cache local SQLite y estado.
+Capa de datos para sunat-tc-app: fetching, cache local SQLite, estado y token.
 
 Funciones de fetching:
     - fetch_day(day_str)        -> lista de dicts {fecha, compra, venta}
     - fetch_month(year, month)
     - fetch_range(start, end, on_progress=...)
+
+APIs:
+    - v1 pública (sin token): https://api.apis.net.pe/v1/tipo-cambio-sunat.
+      Sólo respeta `?fecha=YYYY-MM-DD` (un día) y limita ~20 req/min por IP,
+      así que mes/rango se reconstruyen día a día (lento pero sin token).
+    - v2 con token (opcional): devuelve el mes completo en UNA petición.
+      El token se configura en «Configurar token…» (GUI) y se guarda en
+      config.json junto al caché; la variable de entorno SUNAT_TC_TOKEN
+      tiene prioridad y el token nunca se escribe en logs ni en el código.
 
 Cache local (SQLite en %APPDATA%/sunat-tc-app/cache.db):
     - cache_get / cache_get_range / cache_get_month
@@ -14,10 +23,14 @@ Cache local (SQLite en %APPDATA%/sunat-tc-app/cache.db):
 Estado persistido (JSON en %APPDATA%/sunat-tc-app/state.json):
     - load_state() -> dict
     - save_state(state)
+
+Config local (JSON en %APPDATA%/sunat-tc-app/config.json):
+    - load_token() / save_token(token) / get_api_token() / check_token(token)
 """
 
 from __future__ import annotations
 
+import calendar
 import json
 import logging
 import os
@@ -52,6 +65,10 @@ from .validators import MAX_RANGE_DAYS, MIN_YEAR, validate_month, validate_range
 # ---------------------------------------------------------------------------
 
 API_BASE = "https://api.apis.net.pe/v1/tipo-cambio-sunat"
+# API v2 (token opcional). Devuelve el mes completo en una sola petición
+# (`?month=&year=`) y un día con `?date=`. Mismo token para ambos endpoints
+# v2 probados (decolecta y api.apis.net.pe/v2); se usa el documentado hoy.
+API_V2_BASE = "https://api.decolecta.com/v1/tipo-cambio/sunat"
 HTTP_TIMEOUT = 15  # segundos
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
@@ -77,9 +94,13 @@ def max_year() -> int:
     """
     return date.today().year
 
-# Para "mes completo" decidimos que el cache es confiable si trae al menos
-# estos días (un mes tiene entre 20 y 23 días hábiles aprox.).
-MIN_DAYS_FOR_CACHED_MONTH = 15
+# La API v1 pública no respeta `?month=&year=` (responde con el TC de hoy,
+# ignorando los parámetros) y su nginx limita ~20 req/min por IP (HTTP 429).
+# Sin token, los meses se reconstruyen pidiendo día a día con `?fecha=`, así
+# que el espaciado entre peticiones de red consecutivas debe respetar ese
+# límite (~1 token cada 3s, medido empíricamente contra el API real).
+# Con token (API v2) el mes llega en UNA petición y este pacing no aplica.
+DAY_REQUEST_DELAY = 3.2  # segundos entre peticiones de red consecutivas (v1)
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +130,8 @@ def _ensure_app_data_dir() -> Path:
 
 CACHE_DB: Path = _app_data_dir() / "cache.db"
 STATE_FILE: Path = _app_data_dir() / "state.json"
+# Config local (token de la API v2). Nunca vive en el repositorio.
+CONFIG_FILE: Path = _app_data_dir() / "config.json"
 
 
 def setup_logging(level: int = logging.INFO) -> None:
@@ -142,18 +165,27 @@ def setup_logging(level: int = logging.INFO) -> None:
 # Normalización / HTTP
 # ---------------------------------------------------------------------------
 
+def _first_present(item: dict, *keys: str):
+    """Primer valor presente (no None) entre `keys`.
+
+    Se usa en lugar de `or` para no descartar el 0 numérico (falsy) de una
+    tasa real; ver `_normalize_item`.
+    """
+    for key in keys:
+        value = item.get(key)
+        if value is not None:
+            return value
+    return None
+
+
 def _normalize_item(item: dict) -> dict | None:
     if not isinstance(item, dict):
         return None
-    fecha = item.get("fecha") or item.get("date")
-    # Explicit None check: `or` would treat numeric 0.0 as falsy and fall through
-    # to the legacy English keys, dropping the actual 0-value rate.
-    compra = item.get("compra")
-    if compra is None:
-        compra = item.get("buyPrice")
-    venta = item.get("venta")
-    if venta is None:
-        venta = item.get("sellPrice")
+    # v1: fecha/compra/venta y buyPrice/sellPrice; v2 (decolecta):
+    # date/buy_price/sell_price; v2 (api.apis.net.pe): fecha/precioCompra/precioVenta.
+    fecha = _first_present(item, "fecha", "date")
+    compra = _first_present(item, "compra", "buyPrice", "buy_price", "precioCompra")
+    venta = _first_present(item, "venta", "sellPrice", "sell_price", "precioVenta")
     if not fecha or compra is None or venta is None:
         return None
     fecha_str = str(fecha)[:10]
@@ -181,25 +213,32 @@ def _coerce_list(data) -> list[dict]:
     return []
 
 
-def _get_with_retry(params: dict, max_retries: int = 3) -> list[dict]:
+def _request_with_retry(
+    url: str,
+    params: dict,
+    *,
+    headers: dict | None = None,
+    max_retries: int = 3,
+) -> list[dict]:
     """GET con reintentos exponenciales + jitter. Lanza FetchError en falla persistente.
 
     404/204 no son errores: devuelven [] (legítimamente "sin datos").
+    Los `headers` (p. ej. el Bearer token) nunca se loguean.
     """
     delay = 0.5
     for attempt in range(max_retries):
         try:
-            r = requests.get(API_BASE, params=params, timeout=HTTP_TIMEOUT)
+            r = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
         except requests.RequestException as exc:
             if attempt == max_retries - 1:
                 _logger.error(
                     "GET %s %s: red agotada tras %d intentos: %s",
-                    API_BASE, params, max_retries, exc,
+                    url, params, max_retries, exc,
                 )
                 raise FetchError(kind="network", message=str(exc)) from exc
             _logger.warning(
                 "GET %s %s: intento %d/%d falló (%s); reintento en %.1fs",
-                API_BASE, params, attempt + 1, max_retries, exc, delay,
+                url, params, attempt + 1, max_retries, exc, delay,
             )
             time.sleep(delay + random.uniform(0, delay))
             delay *= 2
@@ -210,7 +249,7 @@ def _get_with_retry(params: dict, max_retries: int = 3) -> list[dict]:
             if attempt == max_retries - 1:
                 _logger.error(
                     "GET %s %s: HTTP %d persistente tras %d intentos",
-                    API_BASE, params, r.status_code, max_retries,
+                    url, params, r.status_code, max_retries,
                 )
                 # 429 (rate limit) stays in RETRYABLE_STATUS so it benefits
                 # from the existing exponential-backoff schedule, but the
@@ -231,7 +270,7 @@ def _get_with_retry(params: dict, max_retries: int = 3) -> list[dict]:
                 )
             _logger.warning(
                 "GET %s %s: HTTP %d (intento %d/%d); reintento en %.1fs",
-                API_BASE, params, r.status_code, attempt + 1, max_retries, delay,
+                url, params, r.status_code, attempt + 1, max_retries, delay,
             )
             time.sleep(delay + random.uniform(0, delay))
             delay *= 2
@@ -239,7 +278,7 @@ def _get_with_retry(params: dict, max_retries: int = 3) -> list[dict]:
         if r.status_code >= 400:
             kind = "http_4xx" if r.status_code < 500 else "http_5xx"
             _logger.error(
-                "GET %s %s: HTTP %d no reintentable", API_BASE, params, r.status_code
+                "GET %s %s: HTTP %d no reintentable", url, params, r.status_code
             )
             raise FetchError(
                 kind=kind,
@@ -252,6 +291,31 @@ def _get_with_retry(params: dict, max_retries: int = 3) -> list[dict]:
             raise FetchError(kind="parse", message=str(exc)) from exc
     # Inalcanzable: cada rama del bucle retorna o lanza.
     raise FetchError(kind="network", message="reintentos agotados")
+
+
+def _get_with_retry(params: dict, max_retries: int = 3) -> list[dict]:
+    """GET a la API pública v1 (sin token); ver `_request_with_retry`."""
+    return _request_with_retry(API_BASE, params, max_retries=max_retries)
+
+
+def _get_v2_with_retry(params: dict, token: str, max_retries: int = 3) -> list[dict]:
+    """GET a la API v2 con `Authorization: Bearer <token>`.
+
+    401/403 se mapean a `FetchError(kind="auth")` SIN reintentar: indican
+    token inválido/vencido (o cuota agotada), no un fallo transitorio. El
+    resto de errores conserva la semántica de `_request_with_retry`.
+    """
+    try:
+        return _request_with_retry(
+            API_V2_BASE,
+            params,
+            headers={"Authorization": f"Bearer {token}"},
+            max_retries=max_retries,
+        )
+    except FetchError as exc:
+        if exc.status in (401, 403):
+            raise FetchError(kind="auth", message=str(exc), status=exc.status) from exc
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +481,77 @@ def cache_clear() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Token de la API v2 (config local)
+# ---------------------------------------------------------------------------
+
+def load_token() -> str | None:
+    """Lee el token desde config.json (None si no hay o el archivo es inválido)."""
+    if not CONFIG_FILE.exists():
+        return None
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    token = data.get("token")
+    if not isinstance(token, str):
+        return None
+    return token.strip() or None
+
+
+def save_token(token: str | None) -> bool:
+    """Guarda (o borra, con None/"") el token en config.json. True si pudo escribir.
+
+    El token vive sólo en %APPDATA%/sunat-tc-app/config.json: nunca en el
+    repositorio, el estado de la ventana ni los logs.
+    """
+    try:
+        _ensure_app_data_dir()
+        data: dict = {}
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, encoding="utf-8") as f:
+                    existing = json.load(f)
+                if isinstance(existing, dict):
+                    data = existing
+            except (OSError, json.JSONDecodeError, ValueError, TypeError):
+                data = {}
+        value = (token or "").strip()
+        if value:
+            data["token"] = value
+        else:
+            data.pop("token", None)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except OSError:
+        return False
+
+
+def get_api_token() -> str | None:
+    """Token vigente: SUNAT_TC_TOKEN (entorno) > config.json > None."""
+    env = os.environ.get("SUNAT_TC_TOKEN", "").strip()
+    if env:
+        return env
+    return load_token()
+
+
+def check_token(token: str) -> bool | None:
+    """Verifica el token contra la API v2 (1 petición al endpoint de hoy).
+
+    True = aceptado; False = rechazado (401/403: inválido, vencido o sin
+    cuota); None = no verificable (sin conexión u otro error transitorio).
+    """
+    try:
+        _get_v2_with_retry({}, token, max_retries=1)
+        return True
+    except FetchError as exc:
+        return False if exc.kind == "auth" else None
+
+
+# ---------------------------------------------------------------------------
 # Fetching (con cache integrado)
 # ---------------------------------------------------------------------------
 
@@ -433,10 +568,17 @@ def fetch_day(day_str: str, *, use_cache: bool = True) -> list[dict]:
                     "venta": cached["venta"],
                 }
             ]
-    data = _get_with_retry({"date": day_str})
+    data = _get_with_retry({"fecha": day_str})
     if not data:
         return []
-    rows = [n for n in (_normalize_item(x) for x in data) if n]
+    # Sólo se acepta el día solicitado: si la API ignorara `fecha` (como
+    # hace con `month`/`year`) devolvería el TC de hoy y se cachearía una
+    # fecha equivocada (ver `_fetch_month_with_flag`).
+    rows = [
+        n
+        for n in (_normalize_item(x) for x in data)
+        if n and n["fecha"] == day_str
+    ]
     if rows:
         cache_put_many([(r["fecha"], r["compra"], r["venta"]) for r in rows])
     return rows
@@ -447,45 +589,134 @@ def _fetch_month_with_flag(
     month: int,
     *,
     use_cache: bool = True,
+    start: date | None = None,
+    end: date | None = None,
+    on_progress: Callable[[str, int], None] | None = None,
 ) -> tuple[list[dict], bool]:
-    """Consulta un mes y devuelve `(rows, network_happened)` (perf-cache-batching P3).
+    """Consulta un mes (o el subrango `[start, end]` dentro de él) y devuelve
+    `(rows, network_happened)`.
 
-    Lee el caché UNA vez (vía `cache_get_month`), aplica el umbral
-    `MIN_DAYS_FOR_CACHED_MONTH` y devuelve las filas junto con un flag que
-    indica si ocurrió una llamada de red. Esto reemplaza el patrón anterior
-    donde `fetch_range` pre-decidía con `_month_requires_network` (otra lectura
-    de caché) y luego llamaba `fetch_month` (que releía el caché).
+    Con token (`get_api_token`) se usa la API v2: el mes completo llega en UNA
+    petición (`?month=&year=`). Sin token se usa la API pública v1, que ya no
+    soporta `?month=&year=` (responde con el TC de hoy sin importar los
+    parámetros): el mes se reconstruye pidiendo día a día con `?fecha=`, el
+    único filtro que la v1 respeta. En ambos modos se descartan los payloads
+    cuya fecha quede fuera de la ventana solicitada, para que una respuesta
+    "de hoy" (o de otro mes) nunca se cuele ni se cachee con otra fecha.
 
-    `network_happened` es False sólo cuando el mes se sirve completo del caché;
-    en cualquier otro caso (caché desactivado, mes actual, caché incompleto o
-    respuesta de red vacía) es True, porque se hizo (o se intentó) una petición.
+    Cache: los días ya cacheados se reutilizan (excepto "hoy", que siempre se
+    re-consulta) y sólo se piden a la red los días faltantes; si la ventana
+    está completa en el caché no se toca la red. `use_cache=False` ignora el
+    caché por completo. `network_happened` es False sólo cuando no se hizo
+    ninguna petición de red.
+
+    Pacing v1: la API pública limita ~20 req/min por IP (nginx responde 429,
+    ver `DAY_REQUEST_DELAY`), así que se espera entre peticiones consecutivas.
+    `on_progress(msg, count)` se llama antes de cada petición de red del modo
+    v1 (la GUI lo usa para pintar el día en curso y cancelar cooperativamente).
     """
     v = validate_month(year, month)
     if isinstance(v, str):
         raise FetchError(kind="input", message=v)
     year, month = v
     today_d = date.today()
-    is_current_month = year == today_d.year and month == today_d.month
-    if use_cache and not is_current_month:
-        cached = cache_get_month(year, month)
-        if len(cached) >= MIN_DAYS_FOR_CACHED_MONTH:
-            return sorted(cached.values(), key=lambda x: x["fecha"]), False
-    data = _get_with_retry({"year": year, "month": month})
-    if not data:
-        return [], True
-    rows = [n for n in (_normalize_item(x) for x in data) if n]
-    if rows:
-        cache_put_many([(r["fecha"], r["compra"], r["venta"]) for r in rows])
-    return rows, True
+    first = date(year, month, 1)
+    last = date(year, month, calendar.monthrange(year, month)[1])
+    # Nunca pedir fechas futuras: el mes en curso termina hoy.
+    last = min(last, today_d)
+    if start is not None:
+        first = max(first, start)
+    if end is not None:
+        last = min(last, end)
+    if first > last:
+        return [], False
+
+    cached = cache_get_month(year, month) if use_cache else {}
+    token = get_api_token()
+    rows: dict[str, dict] = {}
+    fetched: list[dict] = []
+    network_happened = False
+    window_days = [
+        first + timedelta(days=i) for i in range((last - first).days + 1)
+    ]
+
+    if token:
+        # API v2 (con token): el mes llega completo en UNA petición. Si todos
+        # los días de la ventana ya están cacheados (y hoy no está entre
+        # ellos), se responde del caché sin tocar la red.
+        missing = [
+            d
+            for d in window_days
+            if not (use_cache and d < today_d and d.isoformat() in cached)
+        ]
+        if not missing:
+            return (
+                sorted(
+                    (cached[d.isoformat()] for d in window_days),
+                    key=lambda x: x["fecha"],
+                ),
+                False,
+            )
+        data = _get_v2_with_retry({"year": year, "month": month}, token)
+        network_happened = True
+        first_iso, last_iso = first.isoformat(), last.isoformat()
+        for item in data:
+            n = _normalize_item(item)
+            # Sólo días dentro de la ventana: si la API ignorara month/year
+            # (como la v1), su respuesta "de hoy" no se cuela ni se cachea.
+            if n and first_iso <= n["fecha"] <= last_iso:
+                rows[n["fecha"]] = n
+                fetched.append(n)
+        # Huecos de la respuesta se completan con días cacheados previos.
+        for d in window_days:
+            iso = d.isoformat()
+            if iso not in rows and use_cache and d < today_d and iso in cached:
+                rows[iso] = cached[iso]
+    else:
+        # API pública v1 (sin token): se pide día a día con pacing para no
+        # chocar con el límite de ~20 req/min por IP.
+        day = first
+        while day <= last:
+            iso = day.isoformat()
+            if use_cache and day < today_d and iso in cached:
+                rows[iso] = cached[iso]
+            else:
+                if network_happened:
+                    time.sleep(DAY_REQUEST_DELAY)
+                if on_progress:
+                    on_progress(f"Consultando {day.strftime('%d/%m/%Y')}…", len(rows))
+                data = _get_with_retry({"fecha": iso})
+                network_happened = True
+                for item in data:
+                    n = _normalize_item(item)
+                    if n and n["fecha"] == iso:
+                        rows[iso] = n
+                        fetched.append(n)
+            day += timedelta(days=1)
+    if fetched:
+        cache_put_many([(r["fecha"], r["compra"], r["venta"]) for r in fetched])
+    return sorted(rows.values(), key=lambda x: x["fecha"]), network_happened
 
 
-def fetch_month(year: int, month: int, *, use_cache: bool = True) -> list[dict]:
-    """Consulta un mes. Para meses pasados, sirve del cache si está completo.
+def fetch_month(
+    year: int,
+    month: int,
+    *,
+    use_cache: bool = True,
+    on_progress: Callable[[str, int], None] | None = None,
+) -> list[dict]:
+    """Consulta un mes. Sirve del caché los días ya consultados.
 
-    Delega en `_fetch_month_with_flag` (P3) y devuelve sólo las filas,
-    preservando el contrato público existente (GUI/CLI/tests).
+    Con token configurado usa la API v2 (1 petición por mes); sin token
+    reconstruye el mes día a día contra la API pública v1. Delega en
+    `_fetch_month_with_flag` y devuelve sólo las filas, preservando el
+    contrato público existente (GUI/CLI/tests). `on_progress` es opcional
+    (ticks por día de red del modo v1; la GUI lo usa para progreso y
+    cancelación).
     """
-    rows, _ = _fetch_month_with_flag(year, month, use_cache=use_cache)
+    rows, _ = _fetch_month_with_flag(
+        year, month, use_cache=use_cache, on_progress=on_progress
+    )
     return rows
 
 
@@ -496,7 +727,7 @@ def fetch_range(
     use_cache: bool = True,
     on_progress: Callable[[str, int], None] | None = None,
 ) -> list[dict]:
-    """Consulta un rango recorriendo mes a mes.
+    """Consulta un rango recorriendo mes a mes (día a día dentro de cada mes).
 
     Atajo de cortesía: si el mes se sirve enteramente del caché (sin red),
     se omite el `sleep` trailing; si hubo red, se duerme 0.1s (P4). La lectura
@@ -521,7 +752,11 @@ def fetch_range(
                 f"Consultando {nombre} {y} ({month_idx}/{total_months})…",
                 len(resultados),
             )
-        meses, network_happened = _fetch_month_with_flag(y, m, use_cache=use_cache)
+        # `start`/`end` acotan la red a los días del rango: sin esto, un
+        # rango de 3 días pediría el mes completo (~30 peticiones).
+        meses, network_happened = _fetch_month_with_flag(
+            y, m, use_cache=use_cache, start=start, end=end
+        )
         for item in meses:
             try:
                 d = datetime.strptime(item["fecha"], "%Y-%m-%d").date()

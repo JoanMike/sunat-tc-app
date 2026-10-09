@@ -24,7 +24,8 @@ Data is cached locally in SQLite so repeated queries are instant.
 - **Two modes**: interactive Tkinter GUI and a full argparse-based CLI sharing the same data layer.
 - **Query modes**: today, yesterday, arbitrary date range, or a full month.
 - **Quick filters** in the GUI: Today · Yesterday · Last 7 days · Last 30 days · This month · Last month.
-- **Local SQLite cache**: past dates are served instantly; a month (~30 days) takes ~1.5 s from the API and <100 ms from cache.
+- **Optional API token**: with a token, month and range queries resolve in **one request per month** (~1 s); without it, months are rebuilt day by day (minutes, due to the public API's ~20 req/min limit). Configure it in the GUI (**Configurar token…**) or with the `SUNAT_TC_TOKEN` environment variable.
+- **Local SQLite cache**: past dates are served instantly; repeat queries come from the cache in <100 ms.
 - **Export** results to Excel (.xlsx, shared between GUI and CLI) or CSV (UTF-8 with BOM, ready for Excel).
 - **JSON output** for pipelines (`--json`).
 - **Window state persistence** (`state.json`): geometry, mode and dates are restored between sessions.
@@ -71,11 +72,20 @@ python app.py
 
 - Copy selection · Copy all
 - **Clear cache** — deletes the local SQLite database
+- **Configurar token…** — saves/removes the optional API token (see below)
 - Export to Excel…
 
 **Cache indicator** (bottom-right corner): shows how many dates are cached and the range. Click for details.
 
 **What is saved between sessions?** On close, the app persists to `%APPDATA%\sunat-tc-app\state.json`: window position and size, selected mode (Today / Range / Month), and the range dates or month/year. Everything is restored on the next launch.
+
+### API token (optional)
+
+Without a token the app uses the free public API, which only answers **one day per request** and throttles to ~20 requests/minute, so a full month is rebuilt day by day (a couple of minutes the first time). With a token (same provider: [apis.net.pe](https://apis.net.pe/api-tipo-cambio.html) / decolecta) the whole month arrives in **one request** (about a second).
+
+- **GUI**: **Configurar token…** → paste the token → **Guardar**. The app verifies it against the API and stores it in `%APPDATA%\sunat-tc-app\config.json` (never in the repository or the logs). Use **Quitar token** to remove it.
+- **Environment variable** `SUNAT_TC_TOKEN` overrides the saved file (handy for scheduled CLI jobs).
+- The token is optional: without it everything keeps working, just slower for months/ranges.
 
 ### CLI mode
 
@@ -178,8 +188,8 @@ Code responsibilities:
 
 | File | Responsibility |
 |---|---|
-| `core/__init__.py` | Data layer: HTTP with retries, normalization, SQLite cache, JSON state. No UI. Public re-exports. |
-| `core/errors.py` | Typed `FetchError` (kinds: network/http_4xx/http_5xx/parse/rate_limit/input). |
+| `core/__init__.py` | Data layer: HTTP with retries (v1 public + v2 with token), normalization, SQLite cache, JSON state/config. No UI. Public re-exports. |
+| `core/errors.py` | Typed `FetchError` (kinds: network/http_4xx/http_5xx/parse/rate_limit/auth/input). |
 | `core/locale.py` | `MONTHS_ES` / `MONTHS_ABBR_ES` for the Spanish UI. |
 | `core/validators.py` | `validate_range` / `validate_month` + `MIN_YEAR` / `MAX_RANGE_DAYS` constants. |
 | `core/messages.py` | `format_fetch_error` — maps `FetchError` to Spanish messages. |
@@ -191,11 +201,12 @@ Code responsibilities:
 
 ## Notes
 
-- **Data source**: [apis.net.pe](https://apis.net.pe) — a public API that mirrors SUNAT's official exchange rate. No API key required.
-- On weekends and holidays SUNAT does not publish an exchange rate; the API returns the last published date or a partial set for the month/range.
+- **Data source**: [apis.net.pe](https://apis.net.pe) — a public API that mirrors SUNAT's official exchange rate. No API key required; an optional token (see above) switches month/range queries to the v2 endpoint.
+- On weekends and holidays SUNAT publishes no new rate; the API returns the previous business day's closing rate for those dates (per SUNAT's own note).
 - The API has no data for dates before 2000.
-- Network errors are retried with backoff (3 attempts); retries and network/HTTP errors are logged to `%APPDATA%\sunat-tc-app\app.log` (rotating, 512 KB × 3 files).
+- Network errors are retried with backoff (3 attempts); retries and network/HTTP errors are logged to `%APPDATA%\sunat-tc-app\app.log` (rotating, 512 KB × 3 files). The API token is never written to the log.
 - **Cache location**: `%APPDATA%\sunat-tc-app\cache.db` (Windows) / `~/.local/share/sunat-tc-app/cache.db` (Linux/macOS). Everything is cached (buy, sell, date, source, download timestamp). Past dates always use the cache; today's rate is re-fetched every time (it can change). Clear it with the "Clear cache" button or `python app.py --clear-cache`.
+- **Config location**: `%APPDATA%\sunat-tc-app\config.json` (optional API token).
 
 ## License
 

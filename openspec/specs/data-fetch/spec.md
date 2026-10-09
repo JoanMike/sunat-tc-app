@@ -10,14 +10,16 @@ Engram `#1882` (Theme A), Engram `#1883`.
 
 ## Requirements
 
-### Requirement: Typed `FetchError` from `_get_with_retry`
+### Requirement: Typed `FetchError` from `_request_with_retry`
 
-`_get_with_retry` SHALL signal persistent fetch failures by raising a
+`_request_with_retry` SHALL signal persistent fetch failures by raising a
 `FetchError` exception whose `kind` attribute is one of `"network"`,
-`"http_4xx"`, `"http_5xx"`, `"parse"`, `"rate_limit"`, or `"input"`.
-`_get_with_retry` SHALL NOT collapse any fetch failure mode to a silent `[]`.
-A 404 or 204 response (legitimately "no data for this date") is not a failure
-and SHALL continue to return `[]`.
+`"http_4xx"`, `"http_5xx"`, `"parse"`, `"rate_limit"`, `"auth"`, or
+`"input"`. `_request_with_retry` SHALL NOT collapse any fetch failure mode to
+a silent `[]`. A 404 or 204 response (legitimately "no data for this date")
+is not a failure and SHALL continue to return `[]`. `_get_with_retry` (the
+public v1 wrapper) and `_get_v2_with_retry` (the token wrapper) SHALL share
+this implementation.
 
 `FetchError.__init__` SHALL validate that the supplied `kind` is a member of the
 class-level `kinds` tuple. If `kind` is not one of the allowed values,
@@ -29,7 +31,9 @@ the allowed set) BEFORE setting any instance attribute or calling
 `"input"` is reserved for validation failures raised by higher-level fetch
 helpers before an HTTP call. `"rate_limit"` is reserved for API throttling
 semantics so CLI and GUI callers can map it explicitly when that branch is
-introduced.
+introduced. `"auth"` is reserved for API v2 token rejections (HTTP 401/403):
+`_get_v2_with_retry` SHALL map them without retrying, and the Spanish message
+SHALL point the user to the «Configurar token…» action.
 
 (The class-level `kinds` tuple is now enforced at construction, not merely
 documentary. The production fallback in `format_fetch_error` is retained as
@@ -63,48 +67,109 @@ defense-in-depth for paths that bypass `__init__`, e.g. reconstruction via
 - THEN the instance's `.kind == "network"` and `.status is None` and
   `str(instance)` reflects the message
 
-### Requirement: Cache-hit short-circuit in `fetch_range`
+### Requirement: Day-by-day month fetching with per-day cache reuse
 
-`fetch_range` SHALL read each month's cache at most once. A single private
-`_fetch_month_with_flag(year, month, use_cache) -> (rows, network_happened)`
-helper SHALL perform the cache lookup, apply the
-`MIN_DAYS_FOR_CACHED_MONTH` threshold, and return the rows together with a
-`network_happened` boolean. The separate `_month_requires_network`
-pre-check SHALL be removed. The public `fetch_month` SHALL delegate to the
-helper and return only the rows, preserving its existing return contract.
+The v1 API no longer honors `?month=&year=`: it replies with today's rate,
+ignoring both parameters. `fetch_month` / `fetch_range` SHALL reconstruct a
+month by requesting each calendar day with `?fecha=YYYY-MM-DD` (the only
+filter the API respects), capped at today — future dates SHALL never be
+requested. A response item SHALL be accepted only when its `fecha` equals the
+requested day, so a "today" payload can never be surfaced or cached under
+another date. The same exact-date guard SHALL apply to `fetch_day`.
+
+A single private
+`_fetch_month_with_flag(year, month, use_cache, start, end, on_progress)
+-> (rows, network_happened)` helper SHALL perform the cache lookup once per
+month (`cache_get_month`), reuse the cached days (except "today", which SHALL
+always be re-fetched), and request only the missing days from the network.
+`use_cache=False` SHALL bypass the cache entirely; the `start` / `end` bounds
+SHALL clamp the fetch to the days inside the caller's range. The public
+`fetch_month` SHALL delegate to the helper (optionally forwarding
+`on_progress`, called before each network day) and return only the rows,
+preserving its existing return contract.
+
+Consecutive network requests SHALL be paced by `DAY_REQUEST_DELAY` seconds:
+the API's nginx throttles to ~20 req/min per IP (HTTP 429) and the day-by-day
+strategy must stay below that budget.
 
 `fetch_range` SHALL NOT call `time.sleep` between months when every month in
 the range is fully served from the local cache. The politeness sleep SHALL
 run only when `network_happened` is true, with a value of `0.1` seconds
 (previously `0.3`).
 
-(Previously: `fetch_range` skipped `time.sleep(0.3)` on cache hits via a
+(Prior history: `fetch_range` skipped `time.sleep(0.3)` on cache hits via a
 separate `_month_requires_network` pre-check, causing a double cache read per
-month.)
+month; later, the `MIN_DAYS_FOR_CACHED_MONTH` threshold treated a month with
+>= 15 cached rows as complete and skipped the network. That threshold was
+removed in favor of per-day cache reuse.)
 
 #### Scenario: Range fully cached
-- GIVEN every month in `[start, end]` already has at least
-  `MIN_DAYS_FOR_CACHED_MONTH` entries in the cache
+- GIVEN every day in `[start, end]` already has an entry in the cache
 - WHEN `fetch_range(start, end)` is called
 - THEN the returned rows come entirely from cache and `time.sleep` is not
   called (RETAINED)
 
 #### Scenario: Range with network months sleeps 0.1s each
-- GIVEN a month in the range has fewer than `MIN_DAYS_FOR_CACHED_MONTH`
-  cached entries and a network fetch succeeds
+- GIVEN a month in the range has at least one missing (uncached, non-today)
+  day and the network fetch succeeds
 - WHEN `fetch_range(start, end)` is called
 - THEN `time.sleep(0.1)` is called exactly once for that month (not `0.3`)
+
+#### Scenario: API ignores the month-year filter
+- GIVEN the API returns today's rate for every requested day (ignoring
+  `fecha`)
+- WHEN `fetch_month(past_year, past_month)` is called
+- THEN no item is returned and nothing with a mismatched date is cached
 
 #### Scenario: Each month's cache is read at most once
 - GIVEN a multi-month `fetch_range` invocation
 - WHEN the range is processed
 - THEN `cache_get_month` is called at most once per month in the range
 
+### Requirement: Optional API v2 token (config.json / SUNAT_TC_TOKEN)
+
+The application SHALL support an optional API v2 token that makes month and
+range queries resolve in one request per month instead of one request per
+day. The token SHALL live only in `%APPDATA%/sunat-tc-app/config.json` (key
+`"token"`) and SHALL never be written to the repository, the window state, or
+the logs. `SUNAT_TC_TOKEN` (environment variable) SHALL take precedence over
+the file. The GUI SHALL expose a «Configurar token…» action to save, verify
+and remove the token, and `check_token(token)` SHALL verify it against the v2
+day endpoint returning `True` (accepted), `False` (401/403) or `None` (not
+verifiable, e.g. offline).
+
+With a token, `_fetch_month_with_flag` SHALL issue a single `?month=&year=`
+request against the v2 endpoint and SHALL accept only items whose date falls
+inside the requested window (the same guard as the v1 day-by-day path). A
+window fully covered by the cache (excluding "today") SHALL be served without
+network. `fetch_day` SHALL keep using the public v1 endpoint: single-day
+queries already take one request and must not depend on the token.
+
+#### Scenario: Month with token is one request
+- GIVEN a configured token and an uncached month
+- WHEN `fetch_month(year, month)` is called
+- THEN exactly one v2 request is made (`year`/`month` params) and the full
+  month is returned
+
+#### Scenario: Invalid token
+- GIVEN a configured token the API rejects (HTTP 401/403)
+- WHEN a month/range query runs
+- THEN `FetchError(kind="auth")` is raised (no retries) and nothing is cached
+
+#### Scenario: Environment token wins
+- GIVEN a token in `config.json` and a different `SUNAT_TC_TOKEN`
+- WHEN `get_api_token()` is called
+- THEN the environment token is returned
+
 ### Requirement: Numeric `0` preserved by `_normalize_item`
 
 `_normalize_item` SHALL treat a numeric `0` for `compra` or `venta` as valid
 data. The Python `or` operator SHALL NOT be used to chain fallback keys for
-numeric fields, because `0` is falsy and would be discarded.
+numeric fields, because `0` is falsy and would be discarded. The accepted
+key aliases SHALL cover both API generations: `fecha`/`date` for the date and
+`compra`/`buyPrice`/`buy_price`/`precioCompra` and
+`venta`/`sellPrice`/`sell_price`/`precioVenta` for the rates (v1 and the two
+v2 response shapes).
 
 #### Scenario: `compra` is zero
 - GIVEN the API payload `{"fecha": "2025-01-15", "compra": 0, "venta": 3.5}`

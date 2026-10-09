@@ -14,7 +14,9 @@ Funciones:
   - Recuerda la última consulta y posición de ventana
 
 Fuente de datos: https://api.apis.net.pe/v1/tipo-cambio-sunat
-(API pública que replica el tipo de cambio oficial publicado por SUNAT)
+(API pública que replica el tipo de cambio oficial publicado por SUNAT).
+Con un token opcional (botón «Configurar token…») las consultas de mes y
+rango usan la API v2 y se resuelven en una petición por mes.
 
 La capa de datos vive en el paquete `core/`; este archivo sólo contiene el GUI.
 """
@@ -49,13 +51,16 @@ from core import (
     cache_clear,
     cache_count,
     cache_date_range,
+    check_token,
     fetch_day,
     fetch_month,
     fetch_range,
     format_fetch_error,
+    get_api_token,
     load_state,
     max_year,
     save_state,
+    save_token,
     setup_logging,
 )
 
@@ -452,6 +457,11 @@ class SunatTCApp:
             bottom, text="Limpiar caché",
             command=self._on_clear_cache,
         ).pack(side=tk.LEFT, padx=(6, 0))
+        # Token opcional de la API v2: mes/rango en 1 petición por mes.
+        ttk.Button(
+            bottom, text="Configurar token…",
+            command=self._on_configure_token,
+        ).pack(side=tk.LEFT, padx=(6, 0))
         # G5 (gui-polish-ux): "Acerca de…" entry in the bottom bar.
         ttk.Button(
             bottom, text="Acerca de…", command=self._show_about
@@ -630,6 +640,104 @@ class SunatTCApp:
             "Desarrollado por: Jose Miguel Maldonado Garcia\n\n"
             "Consulta el tipo de cambio oficial publicado por SUNAT.",
         )
+
+    # -- token de la API v2 ---------------------------------------------------
+    def _on_configure_token(self) -> None:
+        """Diálogo para guardar/quitar el token de la API v2 (ver `_apply_token`).
+
+        El token se guarda en config.json junto al caché; nunca en el código.
+        """
+        current = get_api_token()
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Token de la API v2 (opcional)")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        frm = ttk.Frame(dlg, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            frm,
+            justify=tk.LEFT,
+            text=(
+                "Con un token, «Mes completo» y los rangos se consultan en\n"
+                "una petición por mes (segundos). Sin token se reconstruyen\n"
+                "día a día (más lento por el límite de la API pública)."
+            ),
+        ).pack(anchor="w")
+        ttk.Label(
+            frm,
+            text=("Token configurado." if current else "Sin token configurado."),
+            foreground=_COLOR_NEUTRAL,
+        ).pack(anchor="w", pady=(6, 0))
+        token_var = tk.StringVar(value=current or "")
+        entry = ttk.Entry(frm, textvariable=token_var, width=48, show="•")
+        entry.pack(fill=tk.X, pady=(6, 0))
+        entry.focus_set()
+
+        def guardar() -> None:
+            value = token_var.get().strip()
+            if not value:
+                messagebox.showwarning(
+                    "Token", "Escriba un token o use «Quitar token»."
+                )
+                return
+            dlg.destroy()
+            self._apply_token(value)
+
+        def quitar() -> None:
+            dlg.destroy()
+            self._apply_token("")
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(btns, text="Guardar", command=guardar).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Quitar token", command=quitar).pack(
+            side=tk.LEFT, padx=6
+        )
+        ttk.Button(btns, text="Cancelar", command=dlg.destroy).pack(side=tk.RIGHT)
+        # Modality best-effort: `grab_set` exige una ventana ya mapeada y el
+        # WM puede no haberlo hecho todavía (p. ej. con el padre oculto en
+        # tests); el diálogo funciona igual sin el grab.
+        with contextlib.suppress(tk.TclError):
+            dlg.grab_set()
+
+    def _apply_token(self, value: str) -> None:
+        """Guarda (o borra, con "") el token y lo verifica contra la API v2."""
+        if not save_token(value):
+            messagebox.showerror(
+                "Token",
+                f"No se pudo guardar la configuración en:\n{STATE_FILE.parent}",
+            )
+            return
+        if not value:
+            messagebox.showinfo(
+                "Token", "Token eliminado. Se usará la API pública (v1)."
+            )
+            self.status.configure(text="Token eliminado.", foreground=_COLOR_NEUTRAL)
+            return
+        veredicto = check_token(value)
+        if veredicto is True:
+            messagebox.showinfo(
+                "Token",
+                "Token guardado y verificado. «Mes completo» y los rangos\n"
+                "se consultarán en 1 petición por mes (más rápido).",
+            )
+            self.status.configure(text="Token verificado.", foreground=_COLOR_OK)
+        elif veredicto is False:
+            messagebox.showwarning(
+                "Token",
+                "El token fue guardado, pero la API lo rechazó.\n"
+                "Revísalo: puede estar mal copiado, vencido o sin cuota.",
+            )
+            self.status.configure(
+                text="Token rechazado por la API.", foreground=_COLOR_NEUTRAL
+            )
+        else:
+            messagebox.showinfo(
+                "Token",
+                "Token guardado, pero no se pudo verificar (¿sin conexión?).\n"
+                "Se usará en la próxima consulta.",
+            )
+            self.status.configure(text="Token guardado.", foreground=_COLOR_OK)
 
     # T3.6 — single helper for the two `os.startfile` call sites
     # (cache-info and export-complete). On `OSError` (or any subclass)
@@ -856,7 +964,13 @@ class SunatTCApp:
                 progress(
                     f"Consultando {MONTHS_ES[params['month']]} {params['year']}…", 0
                 )
-                rows = fetch_month(params["year"], params["month"])
+                # El mes se reconstruye día a día (la API v1 ya no soporta
+                # `?month=&year=`), así que se pasan los ticks por día: la
+                # barra/estado muestran la fecha en curso y `Cancelar` surte
+                # efecto en el siguiente día (no al terminar el mes completo).
+                rows = fetch_month(
+                    params["year"], params["month"], on_progress=progress
+                )
             else:  # range
                 rows = fetch_range(params["start"], params["end"], on_progress=progress)
         except _Cancelled:

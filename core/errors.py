@@ -9,10 +9,19 @@ from __future__ import annotations
 class FetchError(Exception):
     """Raised by core fetch helpers on persistent or non-retryable failures.
 
-    `kind` ∈ {"network", "http_4xx", "http_5xx", "parse", "rate_limit", "input"}.
+    `kind` ∈ {"network", "http_4xx", "http_5xx", "parse", "rate_limit",
+    "auth", "input"}.
     """
 
-    kinds = ("network", "http_4xx", "http_5xx", "parse", "rate_limit", "input")
+    kinds = (
+        "network",
+        "http_4xx",
+        "http_5xx",
+        "parse",
+        "rate_limit",
+        "auth",
+        "input",
+    )
 
     def __init__(self, kind: str, message: str = "", *, status: int | None = None) -> None:
         if kind not in self.kinds:

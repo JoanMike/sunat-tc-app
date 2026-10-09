@@ -895,3 +895,131 @@ def test_set_busy_resets_value_on_idle(app):
         f"_set_busy(False) must reset progress['value'] to 0; got "
         f"{app.progress['value']!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Token de la API v2 — `_apply_token` (guardar / verificar / quitar)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_token_saves_and_verifies(app, monkeypatch):
+    """Guardar un token verificado: persiste vía core y confirma al usuario."""
+    import app as app_module
+
+    saved: list = []
+    checked: list = []
+    infos: list = []
+    monkeypatch.setattr(app_module, "save_token", lambda v: saved.append(v) or True)
+    monkeypatch.setattr(app_module, "check_token", lambda v: checked.append(v) or True)
+    monkeypatch.setattr(
+        app_module.messagebox, "showinfo", lambda *a, **k: infos.append(a)
+    )
+
+    app._apply_token("sk_test.abc")
+
+    assert saved == ["sk_test.abc"], "debe persistir el token vía core.save_token"
+    assert checked == ["sk_test.abc"], "debe verificar el token contra la API"
+    assert infos, "debe informar al usuario que quedó guardado"
+    assert "Token verificado" in str(app.status.cget("text"))
+
+
+def test_apply_token_rejected_by_api_warns(app, monkeypatch):
+    """Token rechazado por la API: se guarda igual pero se advierte."""
+    import app as app_module
+
+    warns: list = []
+    monkeypatch.setattr(app_module, "save_token", lambda v: True)
+    monkeypatch.setattr(app_module, "check_token", lambda v: False)
+    monkeypatch.setattr(
+        app_module.messagebox, "showwarning", lambda *a, **k: warns.append(a)
+    )
+
+    app._apply_token("sk_bad")
+
+    assert warns, "debe advertir que la API rechazó el token"
+    assert "rechazado" in str(app.status.cget("text")).lower()
+
+
+def test_apply_token_unverifiable_shows_info(app, monkeypatch):
+    """Sin conexión (None): se guarda y se avisa que no se pudo verificar."""
+    import app as app_module
+
+    infos: list = []
+    monkeypatch.setattr(app_module, "save_token", lambda v: True)
+    monkeypatch.setattr(app_module, "check_token", lambda v: None)
+    monkeypatch.setattr(
+        app_module.messagebox, "showinfo", lambda *a, **k: infos.append(a)
+    )
+
+    app._apply_token("sk_offline")
+
+    assert infos, "debe informar que se guardó sin verificar"
+    assert "guardado" in str(app.status.cget("text")).lower()
+
+
+def test_apply_token_empty_removes_token(app, monkeypatch):
+    """`_apply_token("")` borra el token sin verificar contra la red."""
+    import app as app_module
+
+    saved: list = []
+    monkeypatch.setattr(app_module, "save_token", lambda v: saved.append(v) or True)
+    monkeypatch.setattr(
+        app_module, "check_token", lambda v: pytest.fail("borrar no debe verificar")
+    )
+
+    app._apply_token("")
+
+    assert saved == [""], "un valor vacío borra el token (core.save_token(''))"
+    assert "eliminado" in str(app.status.cget("text")).lower()
+
+
+def test_apply_token_save_failure_errors(app, monkeypatch):
+    """Si no se puede escribir config.json: error y no se verifica el token."""
+    import app as app_module
+
+    errors: list = []
+    monkeypatch.setattr(app_module, "save_token", lambda v: False)
+    monkeypatch.setattr(
+        app_module, "check_token", lambda v: pytest.fail("no verificar si no se guardó")
+    )
+    monkeypatch.setattr(
+        app_module.messagebox, "showerror", lambda *a, **k: errors.append(a)
+    )
+
+    app._apply_token("sk_test")
+
+    assert errors, "debe mostrar error de escritura"
+
+
+def test_configure_token_dialog_builds(app):
+    """El diálogo «Configurar token…» se construye sin errores ni bloqueos.
+
+    Verifica que abra un Toplevel con los botones Guardar/Quitar token y lo
+    destruye enseguida para no dejar un grab activo entre tests.
+    """
+
+    def _walk(widget):
+        for child in widget.winfo_children():
+            yield child
+            yield from _walk(child)
+
+    before = set(app.root.winfo_children())
+    app._on_configure_token()
+    nuevos = [w for w in app.root.winfo_children() if w not in before]
+    assert nuevos, "debe abrirse el diálogo de token"
+    try:
+        textos = [
+            str(w.cget("text"))
+            for dlg in nuevos
+            for w in _walk(dlg)
+            if w.winfo_class() == "TButton"
+        ]
+        assert any("Guardar" in t for t in textos), f"falta «Guardar»: {textos}"
+        assert any("Quitar token" in t for t in textos), (
+            f"falta «Quitar token»: {textos}"
+        )
+    finally:
+        for dlg in nuevos:
+            with contextlib.suppress(tk.TclError):
+                dlg.grab_release()
+            dlg.destroy()
